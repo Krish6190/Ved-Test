@@ -1,0 +1,12 @@
+# Minimal standalone ved package dependencies.
+# This package is designed to remain small while still supporting LangGraph
+# and Ollama-based model integration as you build out nodes and the graph.
+
+langgraph>=0.1.0
+langchain-core>=0.2.0
+langchain-community>=0.2.0
+langchain-ollama>=0.1.0
+
+# Optional tooling for later graph/node work
+requests>=2.31.0
+pyyaml>=6.0
