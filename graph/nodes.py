@@ -26,6 +26,7 @@ def chat_node(state: VedState, get_llm) -> dict:
             "messages": [AIMessage(content="Ved is hibernating. Switch to turbo or standard mode first.\nTo switch modes, use the command: /mode turbo or /mode standard.\n")],
             "route_intent": state["route_intent"],
             "mode": state["mode"],
+            "saved_memories": state.get("saved_memories", []),
         }
 
     llm = get_llm()
@@ -34,10 +35,17 @@ def chat_node(state: VedState, get_llm) -> dict:
 
     # Bind the combined tools list directly to the model
     llm_with_tools = llm.bind_tools(all_ved_tools)
+    saved_items = state.get("saved_memories", [])
     
+    # 2. Bundle those permanent facts into an un-erasable Core Memory text block
+    long_term_prompt = ""
+    if saved_items:
+        formatted_saves = "\n".join([f"* {item}" for item in saved_items])
+        long_term_prompt = f"\nCRITICAL CORE MEMORY (Never forget these facts):\n{formatted_saves}\n"
     # Enforce categorization rules to stop hallucinated tool usage
     guardrail = SystemMessage(content=(
         "You are an AI agent named Ved. You have access to tools to open apps and websites. "
+        f"{long_term_prompt}"
         "Categorize the user's intent internally before making a decision:\n\n"
         "CATEGORY 1: Conversational Chat\n"
         "- Definition: The user is greeting you, asking a question, or talking.\n"
@@ -53,14 +61,17 @@ def chat_node(state: VedState, get_llm) -> dict:
         "CRITICAL: Be conservative. If you are unsure, default to Category 1."
     ))
     
+    MAX_CONTEXT_MESSAGES = 16
+
     all_messages = state["messages"]
-    if len(all_messages) > 16:
-        all_messages = all_messages[-10:]
+    if len(all_messages) > MAX_CONTEXT_MESSAGES:
+        all_messages = all_messages[-MAX_CONTEXT_MESSAGES:]
     full_prompt = [guardrail] + all_messages
     response = llm_with_tools.invoke(full_prompt)
-    
+    print("DEBUG response:", repr(response.content), "tool_calls:", response.tool_calls)
     return {
         "messages": [response],
         "route_intent": state["route_intent"],
         "mode": state["mode"],
+        "saved_memories": state["saved_memories"],
     }

@@ -1,4 +1,4 @@
-FROM qwen2.5-coder:1.5b
+FROM llama3.2:3b
 
 # Force 100% CPU execution by turning off GPU layers
 PARAMETER num_gpu 0

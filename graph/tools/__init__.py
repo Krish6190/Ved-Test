@@ -5,8 +5,13 @@ from .system_explorer_tools import scan_local_directory
 @tool
 def list_tools() -> str:
     """
-    Use this tool when the user asks what you can do, what features you have, 
-    or explicitly asks you to list or show your available tools.
+    Use this tool ONLY if the user explicitly orders, demands, or commands 
+    you to list, show, print, or name your available tools, skills, or features.
+    
+    CRITICAL PROHIBITION: DO NOT call this tool if the user is just saying hello, 
+    greeting you, checking if you are there, or starting a normal conversation. 
+    Greetings like 'hlo', 'hello', or 'hi' must be handled with pure text chat, 
+    NOT this tool.
     """
     return (
         "Here are my active system tools:\n"
