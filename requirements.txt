@@ -1,0 +1,19 @@
+# Minimal standalone ved package dependencies.
+# This package is designed to remain small while still supporting LangGraph
+# and Ollama-based model integration as you build out nodes and the graph.
+
+langgraph>=0.1.0
+langchain-core>=0.2.0
+langchain-community>=0.2.0
+langchain-ollama>=0.1.0
+
+# Optional tooling for later graph/node work
+requests>=2.31.0
+pyyaml>=6.0
+
+# Fixed dependencies for voice input support on Python 3.14
+SpeechRecognition>=3.10.0
+standard-aifc>=3.13.0
+sounddevice>=0.4.6
+soundfile>=0.12.1
+numpy>=1.26.0
