@@ -5,6 +5,8 @@ import threading
 
 from voice_module import VoiceSystem
 from chatbot import Chatbot
+from Static import font
+
 
 # Windows API constant for excluding a window from screen capture
 WDA_EXCLUDEFROMCAPTURE = 0x00000011
@@ -60,7 +62,7 @@ class VedWidget:
 
         title_label = tk.Label(
             title_bar, text="  ● VED", bg="#12131b", fg="#e5e9f0",
-            font=("Segoe UI Semibold", 10, "bold"), anchor="w"
+            font=("ONE DAY", 10, "bold"), anchor="w"
         )
         title_label.pack(side="left", padx=6)
         self._bind_title_drag(title_label)
@@ -91,7 +93,7 @@ class VedWidget:
 
             text_label = tk.Label(
                 button, text=label, bg="#161b26", fg=color,
-                font=("Segoe UI", 9)
+                font=("Times", 9)
             )
             text_label.pack(side="left", padx=(0, 8), pady=5)
 
@@ -105,7 +107,7 @@ class VedWidget:
         close_button = tk.Button(
             right_group, text="✕", bg="#12131b", fg="#f38ba8",
             bd=0, activebackground="#12131b", activeforeground="#f38ba8",
-            font=("Segoe UI", 11), command=self.root.destroy
+            font=("ONE DAY", 11), command=self.root.destroy
         )
         close_button.pack(side="left", padx=6)
         close_button.bind("<B1-Motion>", lambda event: "break")
@@ -121,8 +123,10 @@ class VedWidget:
             fg="#cdd6f4",
             insertbackground="white", 
             bd=0, 
-            font=("Consolas", 11),
-            wrap="word", # Keeps words from getting cut off at edges
+            font=("Times", 9),
+            wrap="word",
+            padx=5,
+            pady=3,
         )
         self.voice = VoiceSystem(self.root, input_frame, self.input_entry, self._on_enter)
 
@@ -133,11 +137,11 @@ class VedWidget:
         self.content_frame = tk.Frame(self.root, bg="#090a0f")
         self.content_frame.pack(side="top", fill="both", expand=True, padx=10, pady=(8, 4))
 
-        self.line_height = tkfont.Font(font=("Segoe UI", 10)).metrics("linespace")
+        self.line_height = tkfont.Font(font=("ONE DAY", 10)).metrics("linespace")
 
         self.output_text = tk.Text(
             self.content_frame,
-            bg="#090a0f", fg="#e5e9f0", font=("Segoe UI", 10),
+            bg="#090a0f", fg="#e5e9f0", font=("ONE DAY", 10),
             wrap="word", bd=0, highlightthickness=0, padx=2, pady=2,
             state="disabled", spacing3=4, cursor="arrow",
         )

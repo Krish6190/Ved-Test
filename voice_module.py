@@ -1,7 +1,12 @@
-import threading
-import tkinter as tk
 import os
+import threading
+import time
+import tkinter as tk
 import numpy as np
+import sounddevice as sd
+import soundfile as sf
+import speech_recognition as sr
+import Static.font
 class VoiceSystem:
     """Manages speech recognition without using PyAudio."""
     
@@ -11,14 +16,18 @@ class VoiceSystem:
         self.input_entry = input_entry
         self.send_command = send_command
         self.is_listening = False
-        
+        self.is_wake_word_active = True # Controls whether the background listener is on
+        self.wake_phrase = "ved"
+
         self.mic_button = tk.Button(
-            self.input_frame, text="🎙️", bg="#12131b", fg="#a6adc8", bd=0,
+            self.input_frame, text="🎙", bg="#12131b", fg="#a6adc8", bd=0,
             activebackground="#1e1e2e", activeforeground="#b4befe",
-            font=("Segoe UI", 12), cursor="hand2"
+            font=("ONE DAY", 12), cursor="hand2",
+            width=3, justify="center" # <--- Forces a centered, fixed-width square box
         )
         self.mic_button.pack(side="right", padx=(0,5), pady=5)
         self.mic_button.config(command=self.toggle_listening)
+        threading.Thread(target=self._wake_word_monitor_loop, daemon=True).start()
 
     def toggle_listening(self):
         if self.is_listening:
@@ -29,9 +38,10 @@ class VoiceSystem:
     def start_listening(self):
         if self.is_listening:
             return
+        self.is_wake_word_active = False
         self.is_listening = True
         self.mic_button.config(text="🛑", fg="#f38ba8")
-        print("[Voice] Listening started...")
+        print("[Voice] Actively recording your prompt...")
         threading.Thread(target=self._listen_loop, daemon=True).start()
 
     def stop_listening(self):
@@ -39,19 +49,68 @@ class VoiceSystem:
             return
         self.is_listening = False
         self.mic_button.config(text="🎙️", fg="#a6adc8")
+ 
         print("[Voice] Listening stopped.")
         self.root.after(0, lambda: self.input_entry.focus_set())
 
-    def _listen_loop(self):
-        try:
-            import sounddevice as sd
-            import soundfile as sf
-            import speech_recognition as sr
-        except ImportError:
-            print("[Voice Error] Missing packages. Run: python -m pip install sounddevice soundfile numpy speech_recognition")
-            self.root.after(0, self.stop_listening)
-            return
+        def re_arm():
+            self.is_wake_word_active = True
+            print("[Wake Engine] Background listening re-armed.")
 
+        self.root.after(300, re_arm)
+    
+    def _wake_word_monitor_loop(self):
+        """Runs silently in the background checking for the wake phrase."""
+
+        fs = 16000
+        chunk_duration = 2.5 # Keeps a rolling 2.5-second audio window buffer
+        recognizer = sr.Recognizer()
+        
+        print(f"[Wake Engine] Background listening active. Say '{self.wake_phrase}'...")
+
+        while True:
+            # If the user clicks the button or Ved is already processing a prompt, pause wake checking
+            if self.is_listening or not self.is_wake_word_active:
+                time.sleep(0.5)
+                continue
+                
+            try:
+                audio_data = sd.rec(int(chunk_duration * fs), samplerate=fs, channels=1, dtype='int16')
+                sd.wait()
+                
+                volume_score = np.abs(audio_data).mean()
+                if volume_score < 400: # Silence gate threshold
+                    continue
+                    
+                filename = "wake_chunk.wav"
+                sf.write(filename, audio_data, fs)
+                
+                with sr.AudioFile(filename) as source:
+                    audio = recognizer.record(source)
+                    text = recognizer.recognize_google(audio).lower()
+                    
+                    # List of common words Google outputs when it mishears "Ved"
+                    ved_sounds = ["vade","ved", "bed", "bade", "said", "red", "head", "then", "lead", "dead"]
+                    
+                    spoken_words = text.split()
+                    wake_detected = False
+                    
+                    if spoken_words:
+                        first_word = spoken_words[0]
+                        if first_word in ved_sounds:
+                            wake_detected = True
+                    
+                    if wake_detected:
+                        print(f"[Wake Engine] Wake word triggered! (Heard: '{text}')")
+                        self.root.after(0, self.start_listening)
+
+                if os.path.exists(filename):
+                    os.remove(filename)
+                    
+            except Exception:
+                pass
+
+    def _listen_loop(self):
         fs = 16000  # Sample rate
         filename = "temp_voice.wav"
 
@@ -92,14 +151,14 @@ class VoiceSystem:
                             print("[Voice] Pause detected. Stopping capture early.")
                             break
 
-            if not recorded_chunks:
+            if not recorded_chunks or not has_started_talking:
+                print("[Voice] No speech detected after wake command.")
+                self.root.after(0, self.stop_listening)
                 return
 
-            # Flatten array segments together into a standard master wav sound track file
             audio_data = np.concatenate(recorded_chunks, axis=0)
             sf.write(filename, audio_data, fs)
             
-            # Read the audio file using SpeechRecognition
             recognizer = sr.Recognizer()
             with sr.AudioFile(filename) as source:
                 audio = recognizer.record(source)
@@ -109,12 +168,11 @@ class VoiceSystem:
                 
         except Exception as e:
             print(f"[Voice Error] {e}")
+            self.root.after(0, self.stop_listening)
         finally:
-            # Clean up the temporary file safely
             if os.path.exists("temp_voice.wav"):
                 try: os.remove("temp_voice.wav")
                 except: pass        
-        self.root.after(0, self.stop_listening)
 
     def _handle_recognized_text(self, text):
         """Processes words, checks for trigger keywords, and fixes keyboard focus."""
@@ -127,28 +185,21 @@ class VoiceSystem:
         should_auto_send = False
         words = lowercase_text.split()
         if words:
-            last_word = words[-1] # Check the absolute last word spoken
-            
-            # 1. Check if you tried to say "enter"
-            if last_word in enter_sounds:
-                should_auto_send = True
-                # Safely slice off the phonetic word from the UI textbox display
-                orig_words = clean_text.split()
-                clean_text = " ".join(orig_words[:-1])
-                
-            # 2. Check if you tried to say "send"
-            elif last_word in send_sounds:
+            last_word = words[-1]
+            if last_word in enter_sounds or last_word in send_sounds:
                 should_auto_send = True
                 orig_words = clean_text.split()
                 clean_text = " ".join(orig_words[:-1])
 
-        # Update text grid contents
-        self.input_entry.delete("1.0", tk.END)
-        self.input_entry.insert("1.0", clean_text)
-        
-        # Snap typing cursor focus inside the box immediately
-        self.input_entry.focus_set()
-        
-        # Only submit if you explicitly spoke the command words
+        if hasattr(self.input_entry, "delete"):
+            if isinstance(self.input_entry, tk.Text):
+                self.input_entry.delete("1.0", tk.END)
+                self.input_entry.insert("1.0", clean_text)
+            else:
+                self.input_entry.delete(0, tk.END)
+                self.input_entry.insert(0, clean_text)
+
+        self.stop_listening()
+
         if should_auto_send and clean_text:
             self.send_command(None)
