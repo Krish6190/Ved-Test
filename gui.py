@@ -137,11 +137,11 @@ class VedWidget:
         self.content_frame = tk.Frame(self.root, bg="#090a0f")
         self.content_frame.pack(side="top", fill="both", expand=True, padx=10, pady=(8, 4))
 
-        self.line_height = tkfont.Font(font=("ONE DAY", 10)).metrics("linespace")
+        self.line_height = tkfont.Font(font=("Times", 10)).metrics("linespace")
 
         self.output_text = tk.Text(
             self.content_frame,
-            bg="#090a0f", fg="#e5e9f0", font=("ONE DAY", 10),
+            bg="#090a0f", fg="#e5e9f0", font=("Times", 10),
             wrap="word", bd=0, highlightthickness=0, padx=2, pady=2,
             state="disabled", spacing3=4, cursor="arrow",
         )

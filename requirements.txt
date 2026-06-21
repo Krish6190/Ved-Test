@@ -11,9 +11,11 @@ langchain-ollama>=0.1.0
 requests>=2.31.0
 pyyaml>=6.0
 
-# Fixed dependencies for voice input support on Python 3.14
-SpeechRecognition>=3.10.0
-standard-aifc>=3.13.0
+# Requirements for offline voice input and natural online AI voice feedback
 sounddevice>=0.4.6
 soundfile>=0.12.1
 numpy>=1.26.0
+faster-whisper>=1.0.0
+edge-tts>=6.0.0
+
+
