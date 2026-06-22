@@ -2,3 +2,5 @@
 __pycache__/
 *.pyc
 .env
+voice-en_GB-southern_english_female-low.onnx
+voice-en_GB-southern_english_female-low.onnx.json
