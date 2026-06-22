@@ -9,6 +9,7 @@ from faster_whisper import WhisperModel
 import openwakeword
 from openwakeword.model import Model as OWWModel
 from piper import PiperVoice
+from dotenv import load_dotenv
 
 class VoiceSystem:
     def __init__(self, root, input_frame, input_entry, send_command):
@@ -25,8 +26,8 @@ class VoiceSystem:
 
         print("[Voice Engine] Initializing verbal feedback engine...")
         base_dir = os.path.dirname(os.path.abspath(__file__))
-        onnx_path = os.path.join(base_dir, "voice-en_GB-southern_english_female-low.onnx")
-        json_path = os.path.join(base_dir, "voice-en_GB-southern_english_female-low.onnx.json")
+        onnx_path = os.path.join(base_dir, os.getenv("voice_file"))
+        json_path = os.path.join(base_dir, os.getenv("voice_json"))
         
         print("[Voice Engine] Loading AI model... please wait.")
         self.piper_model = PiperVoice.load(onnx_path, json_path)
