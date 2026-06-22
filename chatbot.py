@@ -134,17 +134,12 @@ class Chatbot:
                     timeout=5
                 )
             except Exception:
-                pass  # Ignore if Ollama is unreachable
-        # 3. If waking up or changing active modes, rebuild the graph connection
+                pass
         if mode != "hibernate":
-            # Rebuilding ensures LangGraph hooks into the brand new hardware configuration
             self._graph = build_graph(self._get_llm)
             active_adapter = self.adapters.get(mode)
             if active_adapter and active_adapter.model_name:
                 try:
-                    import requests
-                    # Sending an empty string prompt forces Ollama to read the files 
-                    # off your hard drive and push them into RAM/VRAM immediately.
                     requests.post(
                         f"{base_url}/api/generate",
                         json={
@@ -152,10 +147,10 @@ class Chatbot:
                             "prompt": "", 
                             "keep_alive": "20m"
                         },
-                        timeout=15  # Give it a bit more time to read files from disk
+                        timeout=15
                     )
                 except Exception:
-                    pass 
+                    pass
 
     def handle_command(self, message: str):
         cmd = message.strip().lower()
@@ -177,28 +172,38 @@ class Chatbot:
         cmd_resp = self.handle_command(message)
         if cmd_resp is not None:
             return cmd_resp
-
         if self._hibernating:
             return "(hibernate) Bot is currently hibernating. Use /wake to wake."
-
         adapter = self.adapters.get(self.mode)
         if adapter is None:
             return "No model available for current mode."
+        if not self._conversation_history:
+            initial_messages = [
+                SystemMessage(content=adapter.system_prompt),
+                HumanMessage(content=message)
+            ]
+        else:
+            initial_messages = [HumanMessage(content=message)]
 
-        user_message = HumanMessage(content=message)
         try:
             result = self._graph.invoke({
-                "messages": user_message,
-                "route_intent": "chat",
+                "messages": initial_messages,
+                "route_intent": "",  # Decided dynamically inside graph nodes
                 "mode": self.mode,
-            },config={"configurable": {"system_prompt": adapter.system_prompt}}
-            )
+                "saved_memories": getattr(self, "saved_memories", []),
+                "current_draft": "",
+                "critique_notes": "",
+                "essay_score": 0,
+                "loop_count": 0
+            }, config={"configurable": {"system_prompt": adapter.system_prompt}})
             output_messages = result.get("messages", [])
             if not output_messages:
                 return "[ved] No response from graph."
             assistant_message = output_messages[-1]
             content = getattr(assistant_message, "content", str(assistant_message))
-            self._conversation_history.append(assistant_message)
+            self._conversation_history = list(output_messages)
+            if "saved_memories" in result:
+                self.saved_memories = result["saved_memories"]
             base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
             ollama_active_models = ["None (Loaded from script cache)"]
             try:
@@ -210,7 +215,6 @@ class Chatbot:
             except Exception:
                 ollama_active_models = ["Error reading Ollama status"]
 
-            # Format active models list for output string display
             print("\n" + "="*60)
             print(f"[VED HARDWARE DEBUG]")
             print(f"  -> Requested Python Mode: {self.mode.upper()}")

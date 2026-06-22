@@ -131,7 +131,7 @@ class VedWidget:
         self.voice = VoiceSystem(self.root, input_frame, self.input_entry, self._on_enter)
 
         self.input_entry.pack(side="left", fill="both", expand=True,padx=5, pady=10)
-        self.input_entry.bind("<Return>", lambda event: [self._on_enter(event), "break"])
+        self.input_entry.bind("<Return>", lambda event: [self._on_enter(event) if not getattr(self, 'is_generating', False) else None, "break"])
         self.input_entry.bind("<Shift-Return>", lambda event: None)
 
         self.content_frame = tk.Frame(self.root, bg="#090a0f")
@@ -170,6 +170,8 @@ class VedWidget:
         self.root.geometry(f"+{self._orig_x + dx}+{self._orig_y + dy}")
 
     def _switch_mode(self, mode: str):
+        if mode == self.current_mode:
+            return
         self._append_text(f"[System] Switching to {mode.upper()}...\n\n", "#f9e2af")
         threading.Thread(target=self._do_switch_mode, args=(mode,), daemon=True).start()
 
@@ -182,7 +184,20 @@ class VedWidget:
             self.chatbot.set_mode(mode)
             self.current_mode = mode
             self._update_mode_ui(mode)
-            self._append_text(f"[System] Ved switched to {mode.upper()} mode.\n\n", "#cdd6f4")
+            def refresh_view():
+                self.output_text.configure(state="normal")
+                self.output_text.delete("1.0", "end")
+                self._insert_colored(f"Ved ready — {self.current_mode.upper()} mode.\n", "#a6e3a1")
+                self._insert_colored("="*45 + "\n\n", "#313244")
+                for turn in self.chat_history:
+                    self._insert_colored("You: ", "#89b4fa")
+                    self._insert_colored(f"{turn['user']}\n\n", "#e5e9f0")
+                    self._insert_colored("Ved: ", "#a6e3a1")
+                    self._insert_colored(f"{turn['assistant']}\n\n", "#e5e9f0")
+                self.output_text.configure(state="disabled")
+                self.output_text.see("end")
+                self._resize_to_fit_content()
+            self.root.after(0, refresh_view)
         except Exception as e:
             self._append_text(f"[System] Mode switch failed: {e}\n\n", MODE_COLORS["error"])
 
@@ -219,13 +234,14 @@ class VedWidget:
             self._insert_colored(text, color)
             self.output_text.configure(state="disabled")
             self.output_text.see("end")
-            self._resize_to_fit_content()
         self.root.after(0, action)
 
     def _render_chat_history(self):
         def action():
             self.output_text.configure(state="normal")
             self.output_text.delete("1.0", "end")
+            self._insert_colored(f"Ved ready — {self.current_mode.upper()} mode.\n", "#a6e3a1")
+            self._insert_colored("="*45 + "\n\n", "#313244")   
             for turn in self.chat_history:
                 self._insert_colored("You: ", "#89b4fa")
                 self._insert_colored(f"{turn['user']}\n\n", "#e5e9f0")
@@ -234,7 +250,6 @@ class VedWidget:
             self.output_text.configure(state="disabled")
             self.output_text.see("end")
             self._resize_to_fit_content()
-        self.root.after(0, action)
 
     def _send_command(self):
         prompt = self.input_entry.get("1.0", tk.END).strip()
@@ -242,9 +257,7 @@ class VedWidget:
             return
 
         self.root.after(0, lambda: self.input_entry.delete("1.0", tk.END))
-        self.root.after(0, lambda: self.input_entry.config(state="disabled"))
-        self.root.after(0, self._render_chat_history)
-
+        self.is_generating = True 
         self._append_text("You: ", "#89b4fa")
         self._append_text(f"{prompt}\n\n")
 
@@ -267,7 +280,7 @@ class VedWidget:
                 self.root.after(0, self._render_chat_history)
 
             self._refresh_mode_status()
-            self.root.after(0, lambda: self.input_entry.config(state="normal"))
+            self.is_generating = False # Reset flag
             self.root.after(0, lambda: self.input_entry.focus())
 
     def _hide_from_screen_capture(self):
@@ -292,9 +305,9 @@ class VedWidget:
         def update():
             self.output_text.configure(state="normal")
             self.output_text.delete("1.0", "end")
-            self.output_text.insert("1.0", text)
-            self.output_text.tag_configure("color", foreground=color)
-            self.output_text.tag_add("color", "1.0", "end")
+            # Keeps the header intact on system startup calls
+            self._insert_colored(f"Ved ready — {self.current_mode.upper()} mode.\n", "#a6e3a1")
+            self._insert_colored("="*45 + "\n\n", "#313244")
             self.output_text.configure(state="disabled")
             self.output_text.see("end")
             self._resize_to_fit_content()
@@ -305,24 +318,27 @@ class VedWidget:
         count_result = self.output_text.count("1.0", "end-1c", "displaylines")
         if count_result is not None:
             if isinstance(count_result, (list, tuple)):
-                num_lines = int(count_result[0] or 1)
+                num_lines = int(count_result[0]) if count_result else 1
             else:
-                num_lines = int(count_result or 1)
+                num_lines = int(count_result)
         else:
             num_lines = 1
-
-        needed_content_h = num_lines * self.line_height + 16
+        needed_content_h = num_lines * self.line_height + 32  # Added padding room
         target_content_h = max(self.default_content_h, min(needed_content_h, self.max_content_h))
         target_window_h = self.TITLE_BAR_H + target_content_h + self.INPUT_BAR_H
-
         current_h = self.root.winfo_height()
-        if abs(target_window_h - current_h) > 2:
-            current_x = self.root.winfo_x()
-            current_y = self.root.winfo_y()
-            height_difference = target_window_h - current_h
-            new_y = current_y - height_difference
-            self.root.geometry(f"{self.default_width}x{int(target_window_h)}+{current_x}+{int(new_y)}")
-
+        step_h = current_h + (target_window_h - current_h) * 0.15
+        if abs(target_window_h - current_h) > 1:
+            step_h = current_h + (target_window_h - current_h) * 0.15
+        if abs(target_window_h - step_h) < 1.5:
+            step_h = target_window_h
+        current_x = self.root.winfo_x()
+        current_y = self.root.winfo_y()
+        height_difference = step_h - current_h
+        new_y = current_y - height_difference
+        self.root.geometry(f"{self.default_width}x{int(step_h)}+{current_x}+{int(new_y)}")
+        if step_h != target_window_h:
+            self.root.after(10, self._resize_to_fit_content)
 
 def main():
     root = tk.Tk()
