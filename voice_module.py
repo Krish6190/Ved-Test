@@ -6,14 +6,11 @@ import numpy as np
 import sounddevice as sd
 import soundfile as sf
 from faster_whisper import WhisperModel
-from sqlalchemy import text
-from Static import font
-import edge_tts  
-import asyncio 
+import openwakeword
+from openwakeword.model import Model as OWWModel
+from piper import PiperVoice
 
 class VoiceSystem:
-    """Manages speech recognition without using PyAudio."""
-    
     def __init__(self, root, input_frame, input_entry, send_command):
         self.root = root
         self.input_frame = input_frame
@@ -21,8 +18,7 @@ class VoiceSystem:
         self.send_command = send_command
         self.is_listening = False
         self.is_wake_word_active = True 
-        self.wake_phrase = "nova"
-
+        self.wake_phrase = "alexa"
         self.awaiting_confirmation = False
         self.pending_text = ""
 
@@ -30,9 +26,20 @@ class VoiceSystem:
         self.tts_engine = "en-GB-SoniaNeural"  
 
         print("[Voice Engine] Loading AI model... please wait.")
+        try:
+            self.piper_model = PiperVoice.load("path_to_piper_model.onnx", "path_to_model.json")
+            print("[Voice Engine] Piper TTS loaded successfully.")
+        except Exception as e:
+            print(f"[Voice Engine Warning] Could not load Piper models ({e}). TTS fallback active.")
+            self.piper_model = None
+        print("[Voice Engine] Initializing memory-efficient openWakeWord monitor...")
+        openwakeword.utils.download_models() # Safely downloads official free models if missing
+        self.oww_model = OWWModel(wakeword_models=[self.wake_phrase])
+
+        print("[Voice Engine] Loading AI model... please wait.")
         self.model = WhisperModel("tiny", device="cpu", compute_type="int8")
         print("[Voice Engine] Model loaded successfully.")
-
+        
         self.mic_button = tk.Button(
             self.input_frame, text="🎙", bg="#12131b", fg="#a6adc8", bd=0,
             activebackground="#1e1e2e", activeforeground="#b4befe",
@@ -47,20 +54,19 @@ class VoiceSystem:
 
     def _say_reply(self, text):
         """Helper to say a word out loud safely using natural Edge AI voices."""
-        def run_async_tts():
-            async def speak():
-                communicate = edge_tts.Communicate(text, self.tts_engine)
-                await communicate.save("reply_temp.mp3")
+        def run_offline_tts():
+            if self.piper_model:
+                audio_stream = self.piper_model.synthesize_stream(text)
+                for audio_bytes in audio_stream:
+                    audio_data = np.frombuffer(audio_bytes, dtype=np.int16)
+                    sd.play(audio_data, 16000)
+                    sd.wait() 
+            else:
+                # Kept your original logic string variable as a fallback structure
+                print(f"[TTS Fallback Engine] Piper missing. Attempting fallback print output: {text}")
+                time.sleep(1.0)
                 
-                data, fs = sf.read("reply_temp.mp3")
-                sd.play(data, fs)
-                sd.wait()
-                
-                if os.path.exists("reply_temp.mp3"):
-                    try: os.remove("reply_temp.mp3")
-                    except: pass
-            asyncio.run(speak())
-        threading.Thread(target=run_async_tts, daemon=True).start()
+        threading.Thread(target=run_offline_tts, daemon=True).start()
             
     def trigger_reread(self):
         """Clears text boxes and restarts recording immediately for corrections."""
@@ -78,8 +84,8 @@ class VoiceSystem:
         if self.is_listening:
             self.stop_listening()
         else:
-            threading.Thread(target=self._say_reply, args=("Yes, What's up?",), daemon=True).start()
-            time.sleep(0.4) # Small window so the mic doesn't record its own "Yes?"
+            self._say_reply("Yes, What's up?")
+            time.sleep(0.8) 
             self.start_listening()
 
     def start_listening(self):
@@ -113,61 +119,34 @@ class VoiceSystem:
         """Runs silently in the background checking for the wake phrase."""
 
         fs = 16000
-        chunk_duration = 1.2 # Keeps a rolling 2.5-second audio window buffer
-        
+        chunk_size=1280 
         print(f"[Wake Engine] Background listening active. Say '{self.wake_phrase}'...")
 
-        while True:
-            # If the user clicks the button or Ved is already processing a prompt, pause wake checking
-            if self.is_listening or not self.is_wake_word_active:
-                time.sleep(0.5)
-                continue
-                
-            try:
-                audio_data = sd.rec(int(chunk_duration * fs), samplerate=fs, channels=1, dtype='float32')
-                sd.wait()
-                
-                volume_score = np.abs(audio_data).mean()
-                if volume_score < 0.01: # Silence gate threshold
+        with sd.InputStream(samplerate=fs, channels=1, dtype='int16', blocksize=chunk_size) as stream:
+            while True:
+                if self.is_listening or not self.is_wake_word_active:
+                    time.sleep(0.5)
                     continue
-                self.is_wake_word_active = False  
-                filename = "wake_chunk.wav"
-                sf.write(filename, audio_data, fs)
-                
-                segments, info = self.model.transcribe(filename, beam_size=3, language="en")
-                text = "".join([segment.text for segment in segments]).lower().strip()
-                
-                wake_detected = False
-                
-                # Clean out all punctuation marks from the AI text
-                clean_text = text.replace('.', '').replace(',', '').replace('?', '').replace('!', '')
-                clean_words = clean_text.split()
-                
-                if len(clean_words) <= 2 and "nova" in clean_words:
-                    wake_detected = True
                     
-                if wake_detected:
-                    print(f"[Wake Engine] Wake word triggered! (Heard: '{text}')")
-                    if os.path.exists(filename):
-                        try: os.remove(filename)
-                        except: pass
-
-                    # Speak out loud first to let you know she is listening
-                    self._say_reply("Yes, whats up?")
+                try:
+                    audio_chunk, overflowed = stream.read(chunk_size)
+                    audio_data = audio_chunk.flatten()
+                    prediction = self.oww_model.predict(audio_data)
+                    wake_score = prediction[self.wake_phrase]
                     
-                    # Open the active microphone loop
-                    self.root.after(0, self.start_listening)
-                    continue
-
-                if os.path.exists(filename):
-                    os.remove(filename)
-                
-                # If no wake word was found, turn the monitor engine back on
-                self.is_wake_word_active = True
-
-            except Exception as e:
-                self.is_wake_word_active = True
-                pass
+                    if wake_score > 0.5:
+                        print(f"[Wake Engine] Wake word triggered! (Confidence: {wake_score:.2f})")
+                        self.is_wake_word_active = False  
+                        self._say_reply("Yes, whats up?")
+                        time.sleep(0.8)
+                        
+                        self.root.after(0, self.start_listening)
+                        continue
+                except Exception as e:
+                    self.is_wake_word_active = True
+                    print(f"[Wake Engine Warning] Streaming loop error: {e}")
+                    time.sleep(0.1)
+                    pass
 
     def _listen_loop(self):
         fs = 16000  # Sample rate
