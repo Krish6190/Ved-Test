@@ -11,6 +11,7 @@ from openwakeword.model import Model as OWWModel
 from piper import PiperVoice
 from dotenv import load_dotenv
 load_dotenv()
+import winsound
 
 class VoiceSystem:
     def __init__(self, root, input_frame, input_entry, send_command):
@@ -35,7 +36,7 @@ class VoiceSystem:
         print("[Voice Engine] Piper TTS loaded successfully.")
 
         print("[Voice Engine] Initializing memory-efficient openWakeWord monitor...")
-        self.oww_model = OWWModel(wakeword_models=[self.wake_phrase])
+        self.oww_model = OWWModel(wakeword_models=[self.wake_phrase], vad_threshold=0.25)
 
         print("[Voice Engine] Loading AI model... please wait.")
         self.model = WhisperModel("tiny", device="cpu", compute_type="int8", cpu_threads=4)
@@ -123,10 +124,8 @@ class VoiceSystem:
         
         recorded_chunks = []
         silence_threshold = 150      
-        if self.current_state == "CONFIRMATION":
-            pause_limit_chunks = 6    # Fast cut-off for quick yes/no answers
-        else:
-            pause_limit_chunks = 10  # Longer pause allowed for initial prompt to accommodate natural speech patterns    
+        speech_pause_limit = 6 if self.current_state == "CONFIRMATION" else 12  # Fast trailing cut-off (0.5s - 1s)
+        initial_wait_limit = 50  
         silent_chunk_counter = 0
         has_started_talking = False
 
@@ -144,52 +143,60 @@ class VoiceSystem:
                     audio_chunk, overflowed = stream.read(chunk_size)
                     audio_data = audio_chunk.flatten()
                     volume_score = np.abs(audio_data).mean()
-                    
-                    # 1. Listening for Wake Word Mode
                     if self.current_state == "WAKE_WORD":
                         prediction = self.oww_model.predict(audio_data)
                         wake_score = prediction[self.wake_phrase]
-                        
-                        if wake_score > 0.65 and volume_score > 15:
+                        if wake_score > 0.45:
                             print(f"[Wake Engine] Wake word triggered! (Confidence: {wake_score:.2f})")
                             self.root.after(0, lambda: self.mic_button.config(text="🛑", fg="#f38ba8"))
-                            beep_sample_rate = 16000
-                            beep_duration = 0.1
-                            t = np.linspace(0, beep_duration, int(beep_sample_rate * beep_duration), False)
-                            beep_signal = np.sin(440 * t * 2 * np.pi) * 3000  # 440Hz Sine Wave signal
-                            sd.play(beep_signal.astype(np.int16), beep_sample_rate)
-                            sd.wait()
-
-                            if stream.read_available > 0:
-                                stream.read(stream.read_available)
-                                
+                            self.current_state = "PLAYING"
+                            def play_engine_wake_worker():
+                                audio_asset = "turbo_engine_short.wav"
+                                if os.path.exists(audio_asset):
+                                    try:
+                                        winsound.PlaySound(audio_asset, winsound.SND_FILENAME | winsound.SND_NODEFAULT)
+                                    except Exception as sound_err:
+                                        print(f"[Voice Audio Error] Native driver failed to play wake sound: {sound_err}")
+                                else:
+                                    print(f"[Voice Audio Warning] Could not locate wake asset file: {audio_asset}")
+                                    
+                                print("[Voice] Actively recording your prompt...")
+                                self.current_state = "RECORDING"
+                            threading.Thread(target=play_engine_wake_worker, daemon=True).start()
+                            discard_count = 0
+                            while discard_count < 8:
+                                if stream.read_available >= chunk_size:
+                                    stream.read(chunk_size)
+                                    discard_count += 1
+                                time.sleep(0.01)
+                            if hasattr(self.oww_model, "reset"):
+                                self.oww_model.reset()
                             recorded_chunks = []
                             silent_chunk_counter = 0
                             has_started_talking = False
-                            print("[Voice] Actively recording your prompt...")
-                            self.current_state = "RECORDING"
                         continue
-
                     # 2. Recording Mode
                     if self.current_state in ["RECORDING", "CONFIRMATION"]:
                         recorded_chunks.append(audio_chunk)
-                        
                         if not has_started_talking:
                             if volume_score > silence_threshold:
                                 has_started_talking = True
+                                initial_wait_counter = 0
+                            else:
+                                initial_wait_counter += 1
+                            if initial_wait_counter >= initial_wait_limit:
+                                print("[Voice] Silence timeout: User did not start speaking within 4 seconds.")
+                                silent_chunk_counter = 999 
                         else:
                             if volume_score < silence_threshold:
                                 silent_chunk_counter += 1
                             else:
                                 silent_chunk_counter = 0 
-                            
-                            if silent_chunk_counter >= pause_limit_chunks or len(recorded_chunks) >= 150:
+                        if silent_chunk_counter >= (1 if silent_chunk_counter == 999 else speech_pause_limit) or len(recorded_chunks) >= 250:
                                 print("[Voice] Pause detected. Stopping capture early.")
                                 # Clone chunks to process safely, then clear buffers instantly
                                 current_chunks = list(recorded_chunks)
                                 current_talked = has_started_talking
-                                
-                                # ⚡ Reset all state metrics BEFORE running heavy audio functions
                                 recorded_chunks = []
                                 silent_chunk_counter = 0
                                 has_started_talking = False
@@ -200,19 +207,18 @@ class VoiceSystem:
                     time.sleep(0.05)
 
     def _process_captured_audio(self, chunks, talked, fs, stream):
-        self.root.after(0, lambda: self.mic_button.config(text="🎙️", fg="#a6adc8"))
+        self.root.after(0, lambda: self.mic_button.config(text="🎙", fg="#a6adc8"))
         if not chunks or not talked:
             if self.current_state == "CONFIRMATION":
-                print("[Voice] Silence detected. Assuming default confirmation ('Yes, keep text').")
-                self._process_confirmation_logic("yes", stream)
+                print("[Voice] Silence detected. Keeping input text and dropping locks.")
+                self._process_confirmation_logic("timeout_keep_text", stream)
             else:
+                print("[Voice] Initial prompt silence timeout. Safely unlocking audio loops.")
                 self.current_state = "WAKE_WORD"
-                # FIX: Clear mic data so returning to wake word doesn't self-trigger
                 if stream.read_available > 0:
                     stream.read(stream.read_available)
                 print(f"[Wake Engine] Background listening active. Say '{self.wake_phrase}'...")
             return
-
         try:
             audio_data = np.concatenate(chunks, axis=0).flatten().astype(np.float32) / 32768.0
             segments, info = self.model.transcribe(
@@ -224,12 +230,10 @@ class VoiceSystem:
             )
             text = "".join([segment.text for segment in segments]).strip()
             print(f"[Voice] Recognized text: {text}")
-            
             if self.current_state == "CONFIRMATION":
                 self._process_confirmation_logic(text, stream)
             else:
                 self._process_initial_prompt_logic(text)
-                
         except Exception as e:
             print(f"[Voice Error] {e}")
             self.current_state = "WAKE_WORD"
@@ -265,8 +269,12 @@ class VoiceSystem:
         has_cancel = any(word in words for word in cancel_keywords)
 
         if has_confirm:
-            print("[Voice] Command verified. Executing send_command.")
-            self.root.after(0, lambda: self.send_command(None))
+            if text == "timeout_keep_text":
+                print("[Voice] Confirmation timed out. Keeping text on input bar without sending.")
+                self._say_reply("Timed out. Keeping text.")
+            else:
+                print("[Voice] Confirmation clear choice not heard. Dropping locks.")
+                self._say_reply("No response.")
             self._reset_to_wake_word(stream)
             
         elif has_cancel:

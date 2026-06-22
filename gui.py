@@ -171,7 +171,20 @@ class VedWidget:
     def _switch_mode(self, mode: str):
         if mode == self.current_mode:
             return
-        self._append_text(f"[System] Switching to {mode.upper()}...\n", "#f9e2af")
+        self._append_text(f"[System] Switching to {mode.upper()}...\n\n", "#f9e2af")
+        if mode.lower() == "turbo":
+            def play_turbo_sound():
+                import os
+                import winsound
+                audio_asset = "turbo_engine_short.wav"
+                if os.path.exists(audio_asset):
+                    try:
+                        winsound.PlaySound(audio_asset, winsound.SND_FILENAME | winsound.SND_ASYNC)
+                    except Exception as sound_err:
+                        print(f"[UI Audio Error] Native driver failed to play '{audio_asset}': {sound_err}")
+                else:
+                    print(f"[UI Audio Warning] Could not locate asset: {audio_asset}")
+            threading.Thread(target=play_turbo_sound, daemon=True).start()
         threading.Thread(target=self._do_switch_mode, args=(mode,), daemon=True).start()
 
     def _on_mode_click(self, event, mode: str):
