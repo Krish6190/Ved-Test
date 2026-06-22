@@ -186,21 +186,13 @@ class Chatbot:
             return "No model available for current mode."
 
         user_message = HumanMessage(content=message)
-        self._conversation_history.append(user_message)
-        if len(self._conversation_history) > 20:
-            self._conversation_history = self._conversation_history[-20:]
-
-        messages = []
-        if adapter.system_prompt:
-            messages.append(SystemMessage(content=adapter.system_prompt))
-        messages.extend(self._conversation_history)
-
         try:
             result = self._graph.invoke({
-                "messages": messages,
+                "messages": user_message,
                 "route_intent": "chat",
                 "mode": self.mode,
-            })
+            },config={"configurable": {"system_prompt": adapter.system_prompt}}
+            )
             output_messages = result.get("messages", [])
             if not output_messages:
                 return "[ved] No response from graph."
@@ -210,7 +202,6 @@ class Chatbot:
             base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
             ollama_active_models = ["None (Loaded from script cache)"]
             try:
-                # Query the live process status directly from the engine backend
                 r = requests.get(f"{base_url}/api/ps", timeout=2)
                 if r.status_code == 200:
                     models_data = r.json().get("models", [])

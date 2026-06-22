@@ -1,7 +1,8 @@
-from langchain_core.messages import AIMessage
+from logging import config
 
+from langchain_core.messages import AIMessage, SystemMessage
 from .state import VedState
-
+from langchain_core.runnables import RunnableConfig
 
 def intent_router_node(state: VedState) -> dict:
     """Route user intent to appropriate handler.
@@ -15,12 +16,8 @@ def intent_router_node(state: VedState) -> dict:
         "mode": state["mode"],
     }
 
-
-def chat_node(state: VedState, get_llm) -> dict:
-    """Conversational chat node.
-    
-    Receives state and LLM getter, runs inference, returns response.
-    """
+def chat_node(state: VedState, get_llm, chatbot_instance) -> dict:
+    """Conversational chat node."""
     if state["mode"] == "hibernate":
         return {
             "messages": [AIMessage(content="Ved is hibernating. Switch to turbo or standard mode first.")],
@@ -36,7 +33,13 @@ def chat_node(state: VedState, get_llm) -> dict:
             "mode": state["mode"],
         }
 
-    response = llm.invoke(state["messages"])
+    system_prompt = config.get("configurable", {}).get("system_prompt", "")
+    llm_inputs = []
+    if system_prompt:
+        llm_inputs.append(SystemMessage(content=system_prompt))
+    llm_inputs.extend(state["messages"])
+
+    response = llm.invoke(llm_inputs)
     return {
         "messages": [response],
         "route_intent": state["route_intent"],
