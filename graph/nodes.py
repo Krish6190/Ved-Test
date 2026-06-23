@@ -31,10 +31,25 @@ def intent_router_node(state: VedState, get_llm) -> dict:
     last_user_text = user_messages[-1].content if user_messages else ""
 
     router_prompt = (
-        "Classify this user message into one of the explicit route paths.\n"
-        "CRITICAL RULE: If the user is asking a direct, short question about your identity, what model you are running, "
-        "your current operational mode, or basic setup status, you MUST choose route 'A'. Do not route brief conversational "
-        f"system questions to 'B' or 'C'.\n\nUser Message: {last_user_text}"
+        "You are a strict request classifier. Classify the user message into exactly one route.\n\n"
+        "Route A: Anything conversational — greetings, questions, introductions, identity, opinions, explanations, "
+        "status checks, small talk, or anything that expects a short direct reply. When in doubt, choose A.\n"
+        "Route B: ONLY when the user explicitly says 'write', 'draft', 'compose', 'generate' AND wants a long formal "
+        "document like an essay, report, letter, or article. A sentence like 'my name is X' is NOT route B.\n"
+        "Route C: ONLY explicit requests to run, execute, or compile code or terminal commands.\n\n"
+        "EXAMPLES:\n"
+        "- 'hey' -> A\n"
+        "- 'my name is John' -> A\n"
+        "- 'what is Python' -> A\n"
+        "- 'write me a 1000 word essay on climate change' -> B\n"
+        "- 'draft a formal letter to my landlord' -> B\n"
+        "- 'generate a sales report' -> B\n"
+        "- 'run this script' -> C\n\n"
+        "-''execute the command ls -la' -> C\n"
+        "-'open browser then go to https://whatsappweb.com' -> C\n\n"
+        "-'Text shivam to say I will be late' -> A\n"
+        f"User message: '{last_user_text}'\n\n"
+        "Reply with only A, B, or C."
     )
     try:
         structured_llm = llm.with_structured_output(RouterSchema)
@@ -65,7 +80,10 @@ def chat_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
     if hasattr(llm, "temperature"):
         llm.temperature = 0.1
     full_content = ""
-    token_queue = config.get("configurable", {}).get("token_queue")
+    try:
+        token_queue = config["configurable"]["token_queue"]
+    except (KeyError, TypeError):
+        token_queue = None
     
     for chunk in llm.stream(state.messages):
         if chunk.content:
@@ -107,7 +125,10 @@ def coder_chat_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
             "mode": state.mode
         }
     full_content = ""
-    token_queue = config.get("configurable", {}).get("token_queue")
+    try:
+        token_queue = config["configurable"]["token_queue"]
+    except (KeyError, TypeError):
+        token_queue = None
     for chunk in llm.stream(state.messages):
         if chunk.content:
             full_content += chunk.content

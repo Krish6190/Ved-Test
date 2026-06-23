@@ -24,6 +24,7 @@ class Chatbot(ChatbotCommandProcessor):
         self._llm_cache = {}
         self._conversation_history = []
         self._graph = build_graph(self._get_llm)
+        print(f"[DEBUG] graph after init: {self._graph}")
 
     def _load_persistent_memories(self) -> list:
         if self.memory_db_path.exists():
@@ -91,7 +92,7 @@ class Chatbot(ChatbotCommandProcessor):
                         initial_messages.append(AIMessage(content=pair.get("assistant", ""), additional_kwargs={"pinned": True}))
                 initial_messages.append(HumanMessage(content=message))
             else:
-                initial_messages = [HumanMessage(content=message)]
+                initial_messages = list(self._conversation_history) + [HumanMessage(content=message)]
             input_state = {
                 "messages": initial_messages,
                 "route_intent": "",
@@ -103,7 +104,7 @@ class Chatbot(ChatbotCommandProcessor):
                 "loop_count": 0
             }
             token_queue = queue.Queue()
-            config = {"configurable": {"system_prompt": adapter.system_prompt, "thread_id": "local_session", "token_queue": token_queue}}
+            config = {"configurable": {"system_prompt": adapter.system_prompt, "token_queue": token_queue}}
             last_node_seen = "Unknown"
             final_state = {}
             def run_graph():
@@ -126,9 +127,9 @@ class Chatbot(ChatbotCommandProcessor):
                     yield ("error", item[1])
                 else:
                     yield ("token", item)
-            final_state = self._graph.get_state(config).values
             if final_state and "messages" in final_state:
-                self._conversation_history = list(final_state["messages"])
+                new_messages = final_state["messages"]
+                self._conversation_history = list(initial_messages) + [msg for msg in new_messages if isinstance(msg, AIMessage)]
             ollama_active = ["None"]
             try:
                 base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
