@@ -96,6 +96,7 @@ class Chatbot(ChatbotCommandProcessor):
             # Print hardware debug to background terminal
             ollama_active = ["None"]
             try:
+                base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
                 r = requests.get(f"{base_url}/api/ps", timeout=2)
                 if r.status_code == 200: ollama_active = [m.get("name") for m in r.json().get("models", [])]
             except Exception: ollama_active = ["Error"]

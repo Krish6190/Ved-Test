@@ -4,7 +4,7 @@ from langchain_core.messages import HumanMessage, AIMessage
 from __init__ import MODES
 
 class ChatbotCommandProcessor:
-    def handle_command(self, message: str) -> str or None:
+    def handle_command(self, message: str) -> str | None:
         cmd = message.strip().lower()
         if cmd == "/activate coder":
             try:
@@ -46,7 +46,7 @@ class ChatbotCommandProcessor:
 
         return self._handle_memory_commands(cmd)
 
-    def _handle_memory_commands(self, cmd: str) -> str or None:
+    def _handle_memory_commands(self, cmd: str) -> str | None:
         if cmd == "pin":
             user_msgs = [m for m in self._conversation_history if isinstance(m, HumanMessage)]
             ai_msgs = [m for m in self._conversation_history if isinstance(m, AIMessage)]
