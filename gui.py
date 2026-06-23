@@ -1,12 +1,13 @@
+import time
 import tkinter as tk
 import tkinter.font as tkfont
 import ctypes
 import threading
-
+import os
 from voice_module import VoiceSystem
 from chatbot import Chatbot
 from Static import font
-
+import winsound
 
 # Windows API constant for excluding a window from screen capture
 WDA_EXCLUDEFROMCAPTURE = 0x00000011
@@ -171,20 +172,7 @@ class VedWidget:
     def _switch_mode(self, mode: str):
         if mode == self.current_mode:
             return
-        self._append_text(f"[System] Switching to {mode.upper()}...\n\n", "#f9e2af")
-        if mode.lower() == "turbo":
-            def play_turbo_sound():
-                import os
-                import winsound
-                audio_asset = "turbo_engine_short.wav"
-                if os.path.exists(audio_asset):
-                    try:
-                        winsound.PlaySound(audio_asset, winsound.SND_FILENAME | winsound.SND_ASYNC)
-                    except Exception as sound_err:
-                        print(f"[UI Audio Error] Native driver failed to play '{audio_asset}': {sound_err}")
-                else:
-                    print(f"[UI Audio Warning] Could not locate asset: {audio_asset}")
-            threading.Thread(target=play_turbo_sound, daemon=True).start()
+        self._append_text(f"[System] Switching to {mode.upper()}...\n", "#f9e2af")
         threading.Thread(target=self._do_switch_mode, args=(mode,), daemon=True).start()
 
     def _on_mode_click(self, event, mode: str):
@@ -197,6 +185,15 @@ class VedWidget:
             self.current_mode = mode
             self._update_mode_ui(mode)
             def refresh_view():
+                if mode.lower() == "turbo":
+                    audio_asset = "turbo_engine_short.wav"
+                    if os.path.exists(audio_asset):
+                        try:
+                            winsound.PlaySound(audio_asset, winsound.SND_FILENAME | winsound.SND_ASYNC)
+                        except Exception as sound_err:
+                            print(f"[UI Audio Error] Native driver failed to play '{audio_asset}': {sound_err}")
+                    else:
+                        print(f"[UI Audio Warning] Could not locate asset: {audio_asset}")
                 self.output_text.configure(state="normal")
                 self.output_text.delete("1.0", "end")
                 self._insert_colored(f"Ved ready — {self.current_mode.upper()} mode.\n", "#a6e3a1")
@@ -269,17 +266,16 @@ class VedWidget:
         prompt = self.input_entry.get("1.0", tk.END).strip()
         if not prompt:
             return
-
         self.root.after(0, lambda: self.input_entry.delete("1.0", tk.END))
         self.is_generating = True 
         self._append_text("You: ", "#89b4fa")
-        self._append_text(f"{prompt}\n\n")
+        self._append_text(f"{prompt}\n")
 
         full_response = ""
         try:
             full_response = self.chatbot.respond(prompt)
             self._append_text("Ved: ", "#a6e3a1")
-            self._append_text(f"{full_response}\n\n")
+            self._append_text(f"{full_response}\n")
         except Exception as e:
             full_response = f"Chatbot error: {e}"
             self._append_text(f"\n{full_response}", MODE_COLORS["error"])
