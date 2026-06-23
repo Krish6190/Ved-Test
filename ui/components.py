@@ -28,9 +28,9 @@ class VedComponentLayout(VedWindowBase):
 
         # 2. Render Hardware Buttons
         for icon, label, mode, color in [
+            ("💻", "Coder",    "coder",     "#cba6f7"),
             ("⚡", "Turbo",    "turbo",     "#a6e3a1"),
             ("🧠", "Standard", "standard",  "#89b4fa"),
-            ("💻", "Coder",    "coder",     "#cba6f7"),
             ("😴", "Hibernate","hibernate", "#6c7086"),
         ]:
             btn = tk.Frame(right_group, bg="#161b26", bd=1, relief="flat", cursor="hand2")

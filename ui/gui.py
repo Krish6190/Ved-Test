@@ -4,7 +4,7 @@ import threading
 import tkinter as tk
 import winsound
 from pathlib import Path
-
+import time
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from voice.voice_module import VoiceSystem
@@ -66,13 +66,34 @@ class VedWidget(VedComponentLayout):
         self._append_text("You: ", "#89b4fa")
         self._append_text(f"{prompt}\n", "#e5e9f0")
         try:
-            full_response = self.chatbot.respond(prompt)
-            self._append_text("Ved: ", "#a6e3a1")
-            self._append_text(f"{full_response}\n", "#e5e9f0")
-            if prompt.strip().lower() in ["/activate coder", "/deactivate coder", "/sleep", "/hibernate", "/wake", "/resume"] or prompt.strip().lower().startswith(("/deactivate coder", "/mode")):
+            response_obj = self.chatbot.respond(prompt)
+            if isinstance(response_obj, str):
+                self._append_text("Ved: ", "#a6e3a1")
+                self._append_text(f"{response_obj}\n", "#e5e9f0")
+                full_response = response_obj
+            else:
+                full_response = ""
+                has_printed_header = False
+                for event_type, chunk_data in response_obj:
+                    if event_type == "token":
+                        if not has_printed_header:
+                            self._append_text("Ved: ", "#a6e3a1")
+                            has_printed_header = True
+                        full_response += chunk_data
+                        self._append_stream_chunk(chunk_data, "#e5e9f0")
+                        time.sleep(0.01)
+                    elif event_type == "error":
+                        self._append_text(f"\n{chunk_data}\n", MODE_COLORS["error"])
+                if has_printed_header:
+                    self._append_text("\n", "#e5e9f0")
+                if not has_printed_header and isinstance(full_response, str) and full_response.strip():
+                    self._append_text("Ved: ", "#a6e3a1")
+                    self._append_text(f"{full_response.strip()}\n", "#e5e9f0")
+            cleaned_p = prompt.strip().lower()
+            if cleaned_p in ["/activate coder", "/deactivate coder", "/sleep", "/hibernate", "/wake", "/resume"] or cleaned_p.startswith(("/deactivate coder", "/mode")):
                 self.current_mode = self.chatbot.mode
                 self.root.after(0, lambda: self._update_mode_ui(self.current_mode))
-            if full_response.strip():
+            if isinstance(full_response, str) and full_response.strip():
                 self.chat_history.append({"user": prompt, "assistant": full_response.strip()})
                 self.chat_history = self.chat_history[-10:]
         except Exception as e:
@@ -80,13 +101,26 @@ class VedWidget(VedComponentLayout):
         finally:
             self.is_generating = False
             self.root.after(0, lambda: self.input_entry.focus())
-
     def _append_text(self, text: str, color: str = "#e5e9f0"):
         def action():
             self.output_text.configure(state="normal")
             idx = self.output_text.index("end-1c")
             self.output_text.insert("end", text)
+            # Tag only the isolated string pass to prevent structural leaking
             tag = f"col_{idx.replace('.', '_')}_{len(text)}"
+            self.output_text.tag_configure(tag, foreground=color)
+            self.output_text.tag_add(tag, idx, "end-1c")
+            self.output_text.configure(state="disabled")
+            self.output_text.see("end")
+            self._resize_to_fit_content()
+        self.root.after(0, action)
+
+    def _append_stream_chunk(self, text: str, color: str = "#e5e9f0"):
+        def action():
+            self.output_text.configure(state="normal")
+            idx = self.output_text.index("end-1c")
+            self.output_text.insert("end", text)
+            tag = f"stream_{idx.replace('.', '_')}_{len(text)}"
             self.output_text.tag_configure(tag, foreground=color)
             self.output_text.tag_add(tag, idx, "end-1c")
             self.output_text.configure(state="disabled")

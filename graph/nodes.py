@@ -18,6 +18,7 @@ class RouterSchema(BaseModel):
             "inside the workspace terminal boundaries."
         )
     )
+
 def intent_router_node(state: VedState, get_llm) -> dict:
     """Analyzes the user message to determine the workflow path."""
     llm = get_llm()
@@ -49,7 +50,7 @@ def intent_router_node(state: VedState, get_llm) -> dict:
     }
 
 def chat_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
-    """Conversational chat node handling Path A."""
+    """Conversational chat node handling Path A with real-time streaming hooks."""
     if state.mode == "hibernate":
         return {
             "messages": [AIMessage(content="Ved is hibernating. Switch to turbo or standard mode first.")],
@@ -63,12 +64,17 @@ def chat_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
         }
     if hasattr(llm, "temperature"):
         llm.temperature = 0.1
-    response = llm.invoke(state.messages)
-    return {
-        "messages": [response],
-        "route_intent": state.route_intent,
-        "mode": state.mode
-    }
+    full_content = ""
+    token_queue = config.get("configurable", {}).get("token_queue")
+    
+    for chunk in llm.stream(state.messages):
+        if chunk.content:
+            full_content += chunk.content
+            if token_queue:
+                token_queue.put(chunk.content)
+
+    return {"messages": [AIMessage(content=full_content)], "route_intent": state.route_intent, "mode": state.mode}
+
 def content_pipeline_node(state: VedState) -> dict:
     """Temporary placeholder for Path B: Multi-format document synthesis pipeline."""
     return {
@@ -82,7 +88,7 @@ def python_tool_node(state: VedState) -> dict:
     }
 
 def coder_chat_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
-    """Isolated coding assistant node using Qwen 2.5 Coder 7B."""
+    """Isolated coding assistant node using Qwen 2.5 Coder 7B with streaming support."""
     llm = get_llm()
     if llm is None:
         return {
@@ -100,9 +106,11 @@ def coder_chat_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
             "route_intent": "C",
             "mode": state.mode
         }
-    response = llm.invoke(state.messages)
-    return {
-        "messages": [response],
-        "route_intent": "",
-        "mode": state.mode
-    }
+    full_content = ""
+    token_queue = config.get("configurable", {}).get("token_queue")
+    for chunk in llm.stream(state.messages):
+        if chunk.content:
+            full_content += chunk.content
+            if token_queue:
+                token_queue.put(chunk.content)
+    return {"messages": [AIMessage(content=full_content)], "route_intent": state.route_intent, "mode": state.mode}

@@ -7,6 +7,8 @@ from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from graph import build_graph
 from model_adapter import ModelAdapter, parse_modelfile
 from command_processor import ChatbotCommandProcessor
+import queue
+import threading
 
 class Chatbot(ChatbotCommandProcessor):
     def __init__(self, mode=None):
@@ -69,41 +71,75 @@ class Chatbot(ChatbotCommandProcessor):
                 try: requests.post(f"{base_url}/api/generate", json={"model": active_adapter.model_name, "prompt": "", "keep_alive": "20m"}, timeout=15)
                 except Exception: pass
 
-    def respond(self, message: str) -> str:
+    def respond(self, message: str):
         cmd_resp = self.handle_command(message)
-        if cmd_resp is not None: return cmd_resp
-        if self._hibernating: return "(hibernate) Bot is currently hibernating. Use /wake to wake."
+        if cmd_resp is not None:
+            return cmd_resp
+        if self._hibernating:
+            return "(hibernate) Bot is currently hibernating. Use /wake to wake."
         adapter = self.adapters.get(self.mode)
-        if adapter is None: return "No model available for current mode."
-        
-        pinned_memories = self._load_pinned_contents()
-        if not self._conversation_history:
-            initial_messages = [SystemMessage(content=adapter.system_prompt)]
-            for pair in pinned_memories:
-                if isinstance(pair, dict):
-                    initial_messages.append(HumanMessage(content=pair.get("user", ""), additional_kwargs={"pinned": True}))
-                    initial_messages.append(AIMessage(content=pair.get("assistant", ""), additional_kwargs={"pinned": True}))
-            initial_messages.append(HumanMessage(content=message))
-        else:
-            initial_messages = [HumanMessage(content=message)]
-
-        try:
-            result = self._graph.invoke({"messages": initial_messages, "route_intent": "", "mode": self.mode, "saved_memories": getattr(self, "saved_memories", []), "current_draft": "", "critique_notes": "", "content_score": 0, "loop_count": 0}, config={"configurable": {"system_prompt": adapter.system_prompt}})
-            output_messages = result.get("messages", [])
-            if not output_messages: return "[ved] No response from graph."
-            self._conversation_history = list(output_messages)
-            
-            # Print hardware debug to background terminal
+        if adapter is None:
+            return "No model available for current mode."
+        def _stream_generator():
+            print("[DEBUG] stream generator started")
+            pinned_memories = self._load_pinned_contents()
+            if not self._conversation_history:
+                initial_messages = [SystemMessage(content=adapter.system_prompt)]
+                for pair in pinned_memories:
+                    if isinstance(pair, dict):
+                        initial_messages.append(HumanMessage(content=pair.get("user", ""), additional_kwargs={"pinned": True}))
+                        initial_messages.append(AIMessage(content=pair.get("assistant", ""), additional_kwargs={"pinned": True}))
+                initial_messages.append(HumanMessage(content=message))
+            else:
+                initial_messages = [HumanMessage(content=message)]
+            input_state = {
+                "messages": initial_messages,
+                "route_intent": "",
+                "mode": self.mode,
+                "saved_memories": getattr(self, "saved_memories", []),
+                "current_draft": "",
+                "critique_notes": "",
+                "content_score": 0,
+                "loop_count": 0
+            }
+            token_queue = queue.Queue()
+            config = {"configurable": {"system_prompt": adapter.system_prompt, "thread_id": "local_session", "token_queue": token_queue}}
+            last_node_seen = "Unknown"
+            final_state = {}
+            def run_graph():
+                nonlocal last_node_seen, final_state
+                try:
+                    for chunk in self._graph.stream(input_state, config=config, stream_mode="updates"):
+                        for node_name, node_output in chunk.items():
+                            last_node_seen = node_name
+                            final_state.update(node_output)
+                except Exception as exc:
+                    token_queue.put(("error", str(exc)))
+                finally:
+                    token_queue.put(None)
+            threading.Thread(target=run_graph, daemon=True).start()
+            while True:
+                item = token_queue.get()
+                if item is None:
+                    break
+                if isinstance(item, tuple) and item[0] == "error":
+                    yield ("error", item[1])
+                else:
+                    yield ("token", item)
+            final_state = self._graph.get_state(config).values
+            if final_state and "messages" in final_state:
+                self._conversation_history = list(final_state["messages"])
             ollama_active = ["None"]
             try:
                 base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
                 r = requests.get(f"{base_url}/api/ps", timeout=2)
-                if r.status_code == 200: ollama_active = [m.get("name") for m in r.json().get("models", [])]
-            except Exception: ollama_active = ["Error"]
-            print(f"\n==== [VED HARDWARE DEBUG] ====\n  -> Request Mode: {self.mode.upper()}\n  -> Route chosen: Path {result.get('route_intent', 'Bypassed')}\n  -> RAM Active Models: {', '.join(ollama_active)}\n  -> Context size: {len(self._conversation_history)}\n==============================\n")
-            return getattr(output_messages[-1], "content", str(output_messages[-1]))
-        except Exception as exc: return f"[ved] Graph error: {exc}"
-
+                if r.status_code == 200:
+                    ollama_active = [m.get("name") for m in r.json().get("models", [])]
+            except Exception:
+                ollama_active = ["Error"]
+            print(f"\n==== [VED HARDWARE DEBUG] ====\n  -> Request Mode: {self.mode.upper()}\n  -> Route completed: Node {last_node_seen}\n  -> RAM Active Models: {', '.join(ollama_active)}\n  -> Context size: {len(self._conversation_history)}\n==============================\n")
+        return _stream_generator()
+    
     def _get_memory_filepath(self) -> Path: return self.project_root / "data" / "long_term_memory.json"
     def _load_pinned_contents(self) -> list:
         path = self._get_memory_filepath()

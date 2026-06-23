@@ -13,8 +13,8 @@ class VedWindowBase:
         self.TITLE_BAR_H = 32
         self.INPUT_BAR_H = 55
         self.default_width = 600
-        self.default_content_h = 250  # Capped base boundary height
-        self.max_content_h = 550
+        self.default_content_h = 220  # Capped base boundary height
+        self.max_content_h = 530
 
         self.default_height = self.TITLE_BAR_H + self.default_content_h + self.INPUT_BAR_H
         self.max_height = self.TITLE_BAR_H + self.max_content_h + self.INPUT_BAR_H
