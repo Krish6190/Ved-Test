@@ -1,0 +1,58 @@
+import json
+import re
+from typing import Dict, Any
+from pydantic import BaseModel, Field
+from langchain_core.messages import SystemMessage
+from ..state import VedState
+
+class EvaluationSchema(BaseModel):
+    score: int = Field(description="Quality score from 1 to 100.", ge=1, le=100)
+    critique: str = Field(description="Actionable details on what exactly needs fixing.")
+    web_search_needed: bool = Field(description="True if external factual data or scraping is needed.")
+
+def content_evaluator_node(state: VedState, get_llm) -> Dict[str, Any]:
+    """Path B: Evaluator Stage.
+    
+    Scores the draft asset under strict temperature constraints and determines 
+    if research or rewrite pathways should execute.
+    """
+    llm = get_llm()
+    if not llm:
+        return {"content_score": 0, "critique_notes": "LLM offline", "route_intent": "B"}
+
+    if hasattr(llm, "temperature"):
+        llm.temperature = 0.0
+
+    eval_prompt = (
+        "Analyze the provided draft document. Evaluate structure, completeness, and accuracy.\n"
+        f"DRAFT TO EVALUATE:\n{state.current_draft}"
+    )
+
+    try:
+        structured_llm = llm.with_structured_output(EvaluationSchema)
+        res = structured_llm.invoke([SystemMessage(content=eval_prompt)])
+        score, critique, search = res.score, res.critique, res.web_search_needed
+    except Exception:
+        fallback_prompt = (
+            f"{eval_prompt}\n\nReturn EXACTLY a raw JSON block with no other text:\n"
+            '{"score": int, "critique": "string", "web_search_needed": bool}'
+        )
+        try:
+            raw = llm.invoke([SystemMessage(content=fallback_prompt)])
+            match = re.search(r"\{.*\}", raw.content, re.DOTALL)
+            data = json.loads(match.group(0)) if match else {}
+            score = int(data.get("score", 50))
+            critique = str(data.get("critique", "Fallback parse error occurred."))
+            search = bool(data.get("web_search_needed", False))
+        except Exception:
+            score = 75 if state.loop_count >= 1 else 50
+            critique = "Critique generation failed during fallback parsing parsing protocols."
+            search = False
+
+    next_route = "C" if search else "B"
+    return {
+        "content_score": score,
+        "critique_notes": critique,
+        "route_intent": next_route,
+        "loop_count": state.loop_count + 1
+    }

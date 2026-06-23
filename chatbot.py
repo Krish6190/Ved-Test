@@ -106,14 +106,15 @@ class Chatbot(ChatbotCommandProcessor):
             token_queue = queue.Queue()
             config = {"configurable": {"system_prompt": adapter.system_prompt, "token_queue": token_queue}}
             last_node_seen = "Unknown"
-            final_state = {}
+            accumulated_state = dict(input_state)
             def run_graph():
-                nonlocal last_node_seen, final_state
+                nonlocal last_node_seen, accumulated_state
                 try:
                     for chunk in self._graph.stream(input_state, config=config, stream_mode="updates"):
                         for node_name, node_output in chunk.items():
                             last_node_seen = node_name
-                            final_state.update(node_output)
+                            for key, val in node_output.items():
+                                accumulated_state[key] = val
                 except Exception as exc:
                     token_queue.put(("error", str(exc)))
                 finally:
@@ -127,9 +128,18 @@ class Chatbot(ChatbotCommandProcessor):
                     yield ("error", item[1])
                 else:
                     yield ("token", item)
-            if final_state and "messages" in final_state:
-                new_messages = final_state["messages"]
-                self._conversation_history = list(initial_messages) + [msg for msg in new_messages if isinstance(msg, AIMessage)]
+            if accumulated_state and "messages" in accumulated_state:
+                final_msgs = accumulated_state["messages"]
+                if len(final_msgs) > len(initial_messages):
+                    self._conversation_history = list(final_msgs)
+                else:
+                    new_ai = [m for m in final_msgs if isinstance(m, AIMessage) and m not in initial_messages]
+                    if new_ai:
+                        self._conversation_history = list(initial_messages) + new_ai
+                    else:
+                        self._conversation_history = list(final_msgs)
+            if "saved_memories" in accumulated_state:
+                self.saved_memories = accumulated_state["saved_memories"]
             ollama_active = ["None"]
             try:
                 base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")

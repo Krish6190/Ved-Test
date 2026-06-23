@@ -1,6 +1,7 @@
 from langgraph.graph import StateGraph, START, END
 from .state import VedState
-from .nodes import intent_router_node, chat_node, content_pipeline_node, python_tool_node, coder_chat_node
+from .nodes import intent_router_node, chat_node, python_tool_node, coder_chat_node
+from .content_generation.pipeline_node import content_pipeline_node
 
 def build_graph(get_llm):
     g = StateGraph(VedState)
