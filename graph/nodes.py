@@ -8,9 +8,14 @@ class RouterSchema(BaseModel):
     intent: Literal["A", "B", "C"] = Field(
         description=(
             "Route the user request to the single best matching execution pathway:\n"
-            "A = Standard interactive Q&A, general conversation, casual chat, definitions, greetings, or short code/math concept explanations.\n"
-            "B = Structured long-form text synthesis, multi-paragraph essays, deep formal articles, or research stories. Use this path EVEN IF the request explicitly mentions needing real-time web facts, live statistics, or web-scraped data to complete the essay text.\n"
-            "C = Explicit standalone requests to execute sandboxed Python scripts, process local files, or run system-level utility tools directly without generating a long creative text document."
+            "A = ANY question asking 'what is', 'how does', 'explain', meanings, definitions, terminology, conceptual breakdowns, "
+            "informational queries, status updates, or standard back-and-forth conversation. If the user expects a direct, "
+            "conversational response under 3 paragraphs, you MUST choose 'A'.\n"
+            "B = Explicit requests to generate, draft, compile, or write long-form assets (e.g., 'write an essay', 'compose a letter', "
+            "'draft a multi-paragraph blog article', 'generate a full report'). Do NOT use 'B' unless the user is explicitly "
+            "asking you to perform a creative or formal document generation task.\n"
+            "C = Explicit standalone requests to run commands, execute local files, launch sandboxed scripts, or compile code lines "
+            "inside the workspace terminal boundaries."
         )
     )
 def intent_router_node(state: VedState, get_llm) -> dict:

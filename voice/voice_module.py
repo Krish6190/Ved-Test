@@ -1,3 +1,6 @@
+import sys
+from pathlib import Path
+sys.path.append(str(Path(__file__).resolve().parent.parent))
 import os
 import threading
 import time
@@ -71,11 +74,11 @@ class VoiceSystem:
         if self.piper_model:
             try:
                 raw_bytes = b""
-                for chunk in self.piper_model.synthesize(text):
+                for chunk in self.piper_model.synthesize(text, length_scale=1.15):
                     raw_bytes += chunk.audio_int16_bytes
                 audio_data = np.frombuffer(raw_bytes, dtype=np.int16)
-                silence_padding = np.zeros(7200, dtype=np.int16)
-                silence_trailing = np.zeros(4800, dtype=np.int16)
+                silence_padding = np.zeros(2000, dtype=np.int16)
+                silence_trailing = np.zeros(14000, dtype=np.int16)
                 full_audio = np.concatenate([silence_padding, audio_data, silence_trailing])
                 sd.play(full_audio, 16000)
                 sd.wait() 
@@ -151,7 +154,8 @@ class VoiceSystem:
                             self.root.after(0, lambda: self.mic_button.config(text="🛑", fg="#f38ba8"))
                             self.current_state = "PLAYING"
                             def play_engine_wake_worker():
-                                audio_asset = "turbo_engine_short.wav"
+                                base_dir = os.path.dirname(os.path.abspath(__file__))
+                                audio_asset = os.path.join(base_dir, os.getenv("wake_sound"))
                                 if os.path.exists(audio_asset):
                                     try:
                                         winsound.PlaySound(audio_asset, winsound.SND_FILENAME | winsound.SND_NODEFAULT)
@@ -163,12 +167,8 @@ class VoiceSystem:
                                 print("[Voice] Actively recording your prompt...")
                                 self.current_state = "RECORDING"
                             threading.Thread(target=play_engine_wake_worker, daemon=True).start()
-                            discard_count = 0
-                            while discard_count < 8:
-                                if stream.read_available >= chunk_size:
-                                    stream.read(chunk_size)
-                                    discard_count += 1
-                                time.sleep(0.01)
+                            if stream.read_available > 0:
+                                stream.read(stream.read_available)
                             if hasattr(self.oww_model, "reset"):
                                 self.oww_model.reset()
                             recorded_chunks = []
@@ -259,22 +259,24 @@ class VoiceSystem:
         self.current_state = "CONFIRMATION"
 
     def _process_confirmation_logic(self, text, stream):
-        # Normalize the incoming words
         words = text.lower().replace(',', '').replace('.', '').split() if text else []
         
         confirm_keywords = ["yes", "send", "submit", "execute", "run", "go", "do it", "enter", "correct"]
         cancel_keywords = ["no", "wrong", "stop", "cancel", "don't"]
+        repeat_keywords = ["repeat", "again", "say again"]
         
         has_confirm = any(word in words for word in confirm_keywords)
         has_cancel = any(word in words for word in cancel_keywords)
+        has_repeat = any(word in words for word in repeat_keywords)
 
         if has_confirm:
             if text == "timeout_keep_text":
                 print("[Voice] Confirmation timed out. Keeping text on input bar without sending.")
                 self._say_reply("Timed out. Keeping text.")
             else:
-                print("[Voice] Confirmation clear choice not heard. Dropping locks.")
-                self._say_reply("No response.")
+                print("[Voice] Confirmation positive match heard. Executing pending graph turn...")
+                self._say_reply("Sending.")
+                self.root.after(0, lambda: self.send_command(None))
             self._reset_to_wake_word(stream)
             
         elif has_cancel:
@@ -283,8 +285,14 @@ class VoiceSystem:
             self._say_reply("Canceled.")
             self._reset_to_wake_word(stream)
             
+        elif has_repeat:
+            print("[Voice] Repeat requested. Re-auditing text prompt...")
+            self.root.after(0, lambda: self._say_reply(f"You said: {self.pending_text}. Execute?"))
+            if stream.read_available > 0:
+                stream.read(stream.read_available)
+            self.current_state = "RECORDING"
+            
         else:
-            # ⏱️ 4-Second Silence Gate: If no clear yes/no keyword is heard, say "No response" and exit
             print("[Voice] Confirmation clear choice not heard or timed out. Dropping locks.")
             self._say_reply("No response.")
             self._reset_to_wake_word(stream)
