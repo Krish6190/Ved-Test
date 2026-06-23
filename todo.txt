@@ -2,6 +2,4 @@ _____________________________________________________________
 TODO LIST:
 _____________________________________________________________
 
-1)ADD PIN MECHANISM BACK
-2)START WORKING ON TOOLS
-3)The beep sound after alexa starts doesnt work 
+1)START WORKING ON TOOLS

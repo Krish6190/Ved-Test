@@ -5,37 +5,37 @@ from pydantic import BaseModel, Field
 
 def limit_messages(left: Sequence[BaseMessage], right: Sequence[BaseMessage]) -> list[BaseMessage]:
     """
-    Combines messages. Keeps the permanent system prompt at index 0,
-    and limits the rest to the 38 most recent messages to protect VRAM.
+    Combines messages. Keeps the system prompt at index 0.
+    Protects pinned messages and enforces a strict cap:
+    Pinned messages cannot exceed 20 (half of the 40 limit).
     """
     combined = add_messages(left, right)
-    if len(combined) <= 40:
-        return combined
     system_prompt = None
     pinned_messages = []
-    standard_messages = []
+    normal_messages = []
+    
     for msg in combined:
         if isinstance(msg, SystemMessage) and system_prompt is None:
             system_prompt = msg
-        elif msg.additional_kwargs.get("pinned") is True:
+            continue
+        if getattr(msg, "additional_kwargs", {}).get("pinned", False):
             pinned_messages.append(msg)
         else:
-            standard_messages.append(msg)
-    max_standard = max(2, 38 - len(pinned_messages))
-    recent_messages = standard_messages[-max_standard:]
+            normal_messages.append(msg)
+    if len(pinned_messages) > 20:
+        pinned_messages = pinned_messages[-20:]
+    max_normal_slots = 39 - len(pinned_messages)
+    recent_messages = normal_messages[-max_normal_slots:] if max_normal_slots > 0 else []
     if system_prompt:
         return [system_prompt] + pinned_messages + recent_messages
     return pinned_messages + recent_messages
 
 class VedState(BaseModel):
     messages: Annotated[Sequence[BaseMessage], limit_messages] 
-    route_intent: Literal["A", "B", "C", ""] =Field(
-        default="",
-        description="The workflow route path letter. A=Chat, B=Essay writing loop, C=Python tool scripts."
-        )
-    current_draft: str
-    critique_notes: str
-    essay_score: int
-    loop_count: int
-    mode: str
+    route_intent: Literal["A", "B", "C", ""] = Field(default="")
+    current_draft: str = Field(default="")
+    critique_notes: str = Field(default="")
+    content_score: int = Field(default=0)
+    loop_count: int = Field(default=0)
+    mode: str = Field(default="standard")
     saved_memories: list = Field(default_factory=list)

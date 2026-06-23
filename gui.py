@@ -16,6 +16,7 @@ MODE_COLORS = {
     "turbo":     "#a6e3a1",
     "standard":  "#89b4fa",
     "hibernate": "#6c7086",
+    "coder":     "#b886f6",
     "error":     "#f38ba8",
 }
 
@@ -32,7 +33,7 @@ class VedWidget:
 
         self.TITLE_BAR_H = 32
         self.INPUT_BAR_H = 55
-        self.default_width = 520
+        self.default_width = 600
         self.default_content_h = 280 - self.TITLE_BAR_H - self.INPUT_BAR_H
         self.max_content_h = self.default_content_h * 2
 
@@ -53,7 +54,9 @@ class VedWidget:
         self._build_ui()
         self._hide_from_screen_capture()
         self._update_mode_ui(self.current_mode)
-        self._set_output(f"Ved ready — {self.current_mode.upper()} mode.\n", "#a6e3a1")
+        header_color = MODE_COLORS.get(self.current_mode.lower(), "#a6e3a1")
+        self.sticky_header_label.config(text=f"Ved ready — {self.current_mode.upper()} mode.", fg=header_color)
+
 
     def _build_ui(self):
         title_bar = tk.Frame(self.root, bg="#12131b", height=self.TITLE_BAR_H)
@@ -78,6 +81,7 @@ class VedWidget:
         self.mode_buttons = {}
         self._drag_block_widgets = []
         for icon, label, mode, color in [
+            ("💻", "Coder",    "coder",     "#cba6f7"),
             ("⚡", "Turbo",    "turbo",     "#a6e3a1"),
             ("🧠", "Standard", "standard",  "#89b4fa"),
             ("😴", "Hibernate","hibernate", "#6c7086"),
@@ -138,7 +142,18 @@ class VedWidget:
         self.content_frame = tk.Frame(self.root, bg="#090a0f")
         self.content_frame.pack(side="top", fill="both", expand=True, padx=10, pady=(8, 4))
         self.line_height = tkfont.Font(font=("Arial", 12)).metrics("linespace")
-
+        self.sticky_header_frame = tk.Frame(self.content_frame, bg="#090a0f")
+        self.sticky_header_frame.pack(side="top", fill="x", pady=(0, 4))
+        self.sticky_header_label = tk.Label(
+            self.sticky_header_frame, text="", bg="#090a0f", fg="#a6e3a1",
+            font=("Times", 12, "bold"), anchor="w"
+        )
+        self.sticky_header_label.pack(side="top", fill="x")
+        self.sticky_divider_label = tk.Label(
+            self.sticky_header_frame, text="=============================================", 
+            bg="#090a0f", fg="#313244", anchor="w"
+        )
+        self.sticky_divider_label.pack(side="top", fill="x")
         self.output_text = tk.Text(
             self.content_frame,
             bg="#090a0f", fg="#e5e9f0", font=("Times", 12),
@@ -172,7 +187,13 @@ class VedWidget:
     def _switch_mode(self, mode: str):
         if mode == self.current_mode:
             return
-        self._append_text(f"[System] Switching to {mode.upper()}...\n", "#f9e2af")
+        if mode == "coder":
+            msg = "[System] Initializing CODER pipeline on GPU boundaries...\n"
+        elif self.current_mode == "coder":
+            msg = f"[System] Deactivating CODER and initializing {mode.upper()}...\n"
+        else:
+            msg = f"[System] Switching to {mode.upper()}...\n"
+        self._append_text(msg, "#f9e2af")
         threading.Thread(target=self._do_switch_mode, args=(mode,), daemon=True).start()
 
     def _on_mode_click(self, event, mode: str):
@@ -196,9 +217,10 @@ class VedWidget:
                         print(f"[UI Audio Warning] Could not locate asset: {audio_asset}")
                 self.output_text.configure(state="normal")
                 self.output_text.delete("1.0", "end")
-                self._insert_colored(f"Ved ready — {self.current_mode.upper()} mode.\n", "#a6e3a1")
-                self._insert_colored("="*45 + "\n", "#313244")
+                header_color = MODE_COLORS.get(self.current_mode.lower(), "#a6e3a1")
+                self.sticky_header_label.config(text=f"Ved ready — {self.current_mode.upper()} mode.", fg=header_color)
                 for turn in self.chat_history:
+
                     self._insert_colored("You: ", "#89b4fa")
                     self._insert_colored(f"{turn['user']}\n", "#e5e9f0")
                     self._insert_colored("Ved: ", "#a6e3a1")
@@ -250,8 +272,8 @@ class VedWidget:
         def action():
             self.output_text.configure(state="normal")
             self.output_text.delete("1.0", "end")
-            self._insert_colored(f"Ved ready — {self.current_mode.upper()} mode.\n", "#a6e3a1")
-            self._insert_colored("="*45 + "\n", "#313244")   
+            header_color = MODE_COLORS.get(self.current_mode.lower(), "#a6e3a1")
+            self.sticky_header_label.config(text=f"Ved ready — {self.current_mode.upper()} mode.", fg=header_color)
             for turn in self.chat_history:
                 self._insert_colored("You: ", "#89b4fa")
                 self._insert_colored(f"{turn['user']}\n", "#e5e9f0")
@@ -276,7 +298,13 @@ class VedWidget:
             full_response = self.chatbot.respond(prompt)
             self._append_text("Ved: ", "#a6e3a1")
             self._append_text(f"{full_response}\n")
+            cleaned_p = prompt.strip().lower()
+            if cleaned_p in ["/activate coder", "/deactivate coder", "/sleep", "/hibernate", "/wake", "/resume"] or cleaned_p.startswith("/deactivate coder") or cleaned_p.startswith("/mode"):
+                self.current_mode = self.chatbot.mode
+                self.root.after(0, lambda: self._update_mode_ui(self.current_mode))
+                self.root.after(0, self._render_chat_history)
         except Exception as e:
+
             full_response = f"Chatbot error: {e}"
             self._append_text(f"\n{full_response}", MODE_COLORS["error"])
         finally:
@@ -315,8 +343,8 @@ class VedWidget:
         def update():
             self.output_text.configure(state="normal")
             self.output_text.delete("1.0", "end")
-            self._insert_colored(f"Ved ready — {self.current_mode.upper()} mode.\n", "#a6e3a1")
-            self._insert_colored("="*45 + "\n", "#313244")
+            header_color = MODE_COLORS.get(self.current_mode.lower(), "#a6e3a1")
+            self.sticky_header_label.config(text=f"Ved ready — {self.current_mode.upper()} mode.", fg=header_color)
             self.output_text.configure(state="disabled")
             self.output_text.see("end")
             self._resize_to_fit_content()
