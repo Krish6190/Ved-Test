@@ -24,8 +24,15 @@ def content_evaluator_node(state: VedState, get_llm) -> Dict[str, Any]:
         llm.temperature = 0.0
 
     eval_prompt = (
-        "Analyze the provided draft document. Evaluate structure, completeness, and accuracy.\n"
-        f"DRAFT TO EVALUATE:\n{state.current_draft}"
+        "You are an expert document inspector. Analyze the provided draft text for clarity, structure, and correctness.\n\n"
+        f"DRAFT DOCUMENT:\n{state.current_draft}\n\n"
+        "GRADING SCALARS (CRITICAL):\n"
+        "- Score 80-100: Coherent text answering the request, even if minor phrasing tweaks are possible.\n"
+        "- Score 50-79: Text has structural content but missed length constraints or style guides slightly.\n"
+        "- Score 1-49: Text is corrupted, empty, or completely off-topic.\n\n"
+        "CRITICAL FORMAT RULE:\n"
+        "Return EXACTLY a raw JSON block with no other text, markdown wrapper formatting, or explanations.\n"
+        'JSON Template: {"score": int, "critique": "string description", "web_search_needed": bool}'
     )
 
     try:

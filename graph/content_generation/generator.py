@@ -1,4 +1,3 @@
-# graph/content_generation/generator.py
 from typing import Dict, Any
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_core.runnables import RunnableConfig
@@ -6,10 +5,7 @@ from ..state import VedState
 from graph.rag import rag_db
 
 def content_generator_node(state: VedState, get_llm, config: RunnableConfig) -> Dict[str, Any]:
-    """Path B: Generator Stage. 
-    Generates a new long-form draft asset or refines an existing one using 
-    actionable critique feedback metrics and dynamic sliding-scale MMR context.
-    """
+    """Path B: Generator Stage. Refines draft documents across sliding MMR lookups."""
     llm = get_llm()
     if not llm:
         return {"current_draft": "Error: Local LLM engine is unavailable."}
@@ -17,23 +13,18 @@ def content_generator_node(state: VedState, get_llm, config: RunnableConfig) -> 
     if hasattr(llm, "temperature"):
         llm.temperature = 0.7
         
-    try:
-        token_queue = config["configurable"]["token_queue"]
-    except (KeyError, TypeError):
-        token_queue = None
+    # FIXED: Use explicit safety checks to ensure silent_config blocks streaming leaks
+    token_queue = None
+    if config and "configurable" in config:
+        token_queue = config["configurable"].get("token_queue", None)
 
     user_messages = [msg for msg in state.messages if isinstance(msg, HumanMessage)]
     original_request = user_messages[-1].content if user_messages else "Generate asset"
 
-    # --- THREE-STAGE DYNAMIC MMR RE-BALANCING ---
-    # pass_idx maps cleanly to the 3 attempts:
-    # Pass 1 (loop_count == 0) -> lambda_mult = 0.7 (Strict semantic precision)
-    # Pass 2 (loop_count == 1) -> lambda_mult = 0.4 (Injected diversity)
-    # Pass 3 (loop_count == 2) -> lambda_mult = 0.2 (Maximum diversity fallback)
     pass_idx = getattr(state, "loop_count", 0)
     lambda_mult = max(0.2, 0.7 - (pass_idx * 0.25))
 
-    # Vectorized, hardware-accelerated local vector DB similarity call
+    # Perform a hardware-accelerated SIMD matrix vector query
     context_chunks = rag_db.query_similarity(original_request, k=3, lambda_mult=lambda_mult)
     rag_context = "\n---\n".join([c["content"] for c in context_chunks]) if context_chunks else ""
 

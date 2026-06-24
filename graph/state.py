@@ -4,11 +4,7 @@ from langchain_core.messages import BaseMessage, SystemMessage
 from pydantic import BaseModel, Field
 
 def limit_messages(left: Sequence[BaseMessage], right: Sequence[BaseMessage]) -> list[BaseMessage]:
-    """
-    Combines messages. Keeps the system prompt at index 0.
-    Protects pinned messages and enforces a strict cap:
-    Pinned messages cannot exceed 20 (half of the 40 limit).
-    """
+    """Combines message history arrays. Preserves the top system prompt and protects long-term memory pins."""
     combined = add_messages(left, right)
     system_prompt = None
     pinned_messages = []
@@ -22,10 +18,13 @@ def limit_messages(left: Sequence[BaseMessage], right: Sequence[BaseMessage]) ->
             pinned_messages.append(msg)
         else:
             normal_messages.append(msg)
+            
     if len(pinned_messages) > 20:
         pinned_messages = pinned_messages[-20:]
+        
     max_normal_slots = 39 - len(pinned_messages)
     recent_messages = normal_messages[-max_normal_slots:] if max_normal_slots > 0 else []
+    
     if system_prompt:
         return [system_prompt] + pinned_messages + recent_messages
     return pinned_messages + recent_messages

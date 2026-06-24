@@ -1,45 +1,37 @@
+import re
 from pydantic import BaseModel, Field
 from typing import Literal
 from langchain_core.messages import AIMessage, SystemMessage, HumanMessage
 from .state import VedState
 from langchain_core.runnables import RunnableConfig
 
-class RouterSchema(BaseModel):
-    intent: Literal["A", "B", "C"] = Field(
-        description=(
-            "Route the user request to the single best matching execution pathway:\n"
-            "A = ANY question asking 'what is', 'how does', 'explain', meanings, definitions, terminology, conceptual breakdowns, "
-            "informational queries, status updates, or standard back-and-forth conversation."
-            "B = Explicit requests to generate, draft, compile, or write long-form assets (e.g., 'write an essay', 'compose a letter', "
-            "'draft a multi-paragraph blog article', 'generate a full report') of any size."
-            "C = Explicit standalone requests to run commands, execute local files, launch sandboxed scripts, or compile code lines "
-            "inside the workspace terminal boundaries."
-        )
-    )
-
 def intent_router_node(state: VedState, get_llm) -> dict:
-    """Analyzes the user message to determine the workflow path."""
+    """Analyzes the user message to determine the optimal workflow path with fallback safety."""
     user_messages = [msg for msg in state.messages if isinstance(msg, HumanMessage)]
     last_user_text = user_messages[-1].content.strip() if user_messages else ""
     lower_text = last_user_text.lower()
+    
+    # 1. Fast Keyword/Regex Intercept Layers (Instant response, zero LLM latency)
     content_triggers = ["generate", "write me", "draft", "compose", "summarize", "summary of"]
     if any(trigger in lower_text for trigger in content_triggers):
-        return {"route_intent": "B", "messages": state.messages, "mode": state.mode}
+        return {"route_intent": "B"}
     if lower_text.startswith("/run") or lower_text.startswith("execute"):
-        return {"route_intent": "C", "messages": state.messages, "mode": state.mode}
+        return {"route_intent": "C"}
+        
     llm = get_llm()
-    if llm is None:
-        return {"route_intent": "A", "messages": state.messages, "mode": state.mode}
+    if llm is None: 
+        return {"route_intent": "A"}
 
-    if hasattr(llm, "temperature"):
-        llm.temperature = 0.0
+    # 2. Complete, Unabridged Prompt System to Guard Decision Quality
     router_prompt = (
-        "You are a strict request classifier. Classify the user message into exactly one route.\n\n"
-        "Route A: Anything conversational — greetings, questions, introductions, identity, opinions, explanations, "
-        "status checks, small talk, or anything that expects a short direct reply. When in doubt, choose A.\n"
-        "Route B: Request to 'write', 'draft', 'compose', 'generate' AND wants a long formal "
-        "document like an essay, report, letter, or article. A sentence like 'my name is X' is NOT route B.\n"
-        "Route C: ONLY explicit requests to run, execute, or compile code or terminal commands.\n\n"
+        "You are a strict request classifier. Your sole job is to classify the user message into exactly one route.\n\n"
+        "THE PROTOCOLS:\n"
+        "Route A: ANY question asking 'what is', 'how does', 'explain', meanings, definitions, terminology, conceptual breakdowns, "
+        "informational queries, status updates, greetings, small talk, or standard back-and-forth conversation. When in doubt, choose A.\n"
+        "Route B: Explicit requests to generate, draft, compile, or write long-form assets (e.g., 'write an essay', 'compose a letter', "
+        "'draft a multi-paragraph blog article', 'generate a full report') of any size.\n"
+        "Route C: Explicit standalone requests to run commands, execute local files, launch sandboxed scripts, or compile code lines "
+        "inside the workspace terminal boundaries.\n\n"
         "EXAMPLES:\n"
         "- 'hey' -> A\n"
         "- 'my name is John' -> A\n"
@@ -47,33 +39,26 @@ def intent_router_node(state: VedState, get_llm) -> dict:
         "- 'write me a 1000 word essay on climate change' -> B\n"
         "- 'draft a formal letter to my landlord' -> B\n"
         "- 'generate a sales report' -> B\n"
-        "- 'run this script' -> C\n\n"
-        "-''execute the command ls -la' -> C\n"
-        "-'open browser then go to https://whatsappweb.com' -> C\n\n"
-        "-'Text shivam to say I will be late' -> A\n"
+        "- 'run this script' -> C\n"
+        "- 'execute the command ls -la' -> C\n"
+        "- 'open browser then go to https://whatsappweb.com' -> C\n"
+        "- 'Text shivam to say I will be late' -> A\n\n"
         f"User message: '{last_user_text}'\n\n"
-        "Reply with only a single character A, B, or C."
+        "OUTPUT FORMAT RULE:\n"
+        "Reply with ONLY a single character: A, B, or C. Do not output any markdown, explanations, or surrounding text."
     )
+    
     try:
-        structured_llm = llm.with_structured_output(RouterSchema)
-        response = structured_llm.invoke([SystemMessage(content=router_prompt)])
-        chosen_route = response.intent
+        # Direct raw token invocation avoids structured tool loops entirely
+        raw_res = llm.invoke([SystemMessage(content=router_prompt)]).content.strip().upper()
+        
+        # Robust regex fallback wrapper: looks for the first standalone A, B, or C in the response
+        match = re.search(r"\b([A-C])\b", raw_res)
+        chosen_route = match.group(1) if match else "A"
     except Exception:
-        try:
-            raw_res = llm.invoke([SystemMessage(content=router_prompt)]).content.strip()
-            if "B" in raw_res:
-                chosen_route = "B"
-            elif "C" in raw_res:
-                chosen_route = "C"
-            else:
-                chosen_route = "A"
-        except Exception:
-            chosen_route = "A"
-    return {
-        "route_intent": chosen_route,
-        "messages": state.messages,
-        "mode": state.mode
-    }
+        chosen_route = "A"
+        
+    return {"route_intent": chosen_route}
 
 def chat_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
     """Conversational chat node handling Path A with real-time streaming hooks."""

@@ -7,7 +7,7 @@ def build_graph(get_llm):
     g = StateGraph(VedState)
     g.add_node("intent_router_node", lambda state, config: intent_router_node(state, get_llm))
     g.add_node("chat_node", lambda state, config: chat_node(state, get_llm, config))
-    g.add_node("content_pipeline_node", content_pipeline_node)
+    g.add_node("content_pipeline_node", lambda state, config: content_pipeline_node(state, get_llm, config))
     g.add_node("python_tool_node", python_tool_node)
     g.add_node("coder_chat_node", lambda state, config: coder_chat_node(state, get_llm, config))
     g.add_conditional_edges(
