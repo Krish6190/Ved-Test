@@ -55,11 +55,10 @@ class VedWindowBase:
         self._drag_y = 0
         self._orig_x = 0
         self._orig_y = 0
-        # Parent to a message-only window before first paint so the shell never
-        # registers a taskbar entry, then apply the TOOLWINDOW style as a backstop.
-        self._detach_from_shell()
-        self.root.after(150, self._apply_window_style)
-        self.root.after(500, self._apply_window_style)
+        # Forces a standard window registration style so it remains switchable
+        self.root.update_idletasks()
+        self.root.deiconify()
+        self.root.after(100, self._apply_window_style)
     # ------------------------------------------------------------------ #
     # HWND helpers
     # ------------------------------------------------------------------ #
@@ -68,42 +67,22 @@ class VedWindowBase:
         root_hwnd  = ctypes.windll.user32.GetAncestor(child_hwnd, GA_ROOT)
         return root_hwnd if root_hwnd else child_hwnd
 
-    def _detach_from_shell(self):
-        """Parent the HWND to a hidden message-only window while the root is
-        still withdrawn. The shell only creates taskbar buttons for top-level
-        windows with no owner, so this suppresses the button permanently."""
-        try:
-            self.root.update_idletasks()
-            hwnd = self._get_root_hwnd()
-
-            self._msg_hwnd = ctypes.windll.user32.CreateWindowExW(
-                0, "Static", None, 0, 0, 0, 0, 0,
-                HWND_MESSAGE, None, None, None
-            )
-            ctypes.windll.user32.SetWindowLongPtrW(hwnd, GWL_HWNDPARENT, self._msg_hwnd)
-            ctypes.windll.user32.SetWindowPos(
-                hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED
-            )
-            self.root.deiconify()
-        except Exception as e:
-            print(f"[ved] Shell detach error: {e}")
-
     def _apply_window_style(self):
-        """Set WS_EX_TOOLWINDOW and clear WS_EX_APPWINDOW.
-        TOOLWINDOW is the unconditional shell signal to suppress taskbar buttons."""
+        """Forces the window back into the Windows standard application shell layout 
+        so that it becomes selectable during an Alt-Tab key hold event.
+        """
         try:
             self.root.update_idletasks()
             hwnd = self._get_root_hwnd()
             cur  = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-            new  = (cur & ~WS_EX_APPWINDOW) | WS_EX_TOOLWINDOW
+            new  = (cur & ~WS_EX_TOOLWINDOW) | WS_EX_APPWINDOW
             ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, new)
             ctypes.windll.user32.SetWindowPos(
                 hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
                 SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED
             )
         except Exception as e:
-            print(f"[ved] Style error: {e}")
+            print(f"[ved] Shell window style recovery failure: {e}")
     # ------------------------------------------------------------------ #
     # Screen capture exclusion
     # ------------------------------------------------------------------ #
@@ -123,7 +102,7 @@ class VedWindowBase:
     # ------------------------------------------------------------------ #
     def _safe_minimize(self):
         self._show_tray_icon()
-        ctypes.windll.user32.ShowWindow(self._get_root_hwnd(), SW_HIDE)
+        self.root.withdraw()
 
     def _show_tray_icon(self):
         self._tray = tk.Toplevel(self.root)
@@ -156,10 +135,9 @@ class VedWindowBase:
     def _restore_from_tray(self, event=None):
         if hasattr(self, "_tray") and self._tray.winfo_exists():
             self._tray.destroy()
+        self.root.deiconify()
         hwnd = self._get_root_hwnd()
-        # Re-assert style before the shell sees the window become visible
         self._apply_window_style()
-        ctypes.windll.user32.ShowWindow(hwnd, SW_SHOWNA)
         ctypes.windll.user32.SetForegroundWindow(hwnd)
         self.root.after(50, lambda: self.input_entry.focus_set() if hasattr(self, "input_entry") else None)
     # ------------------------------------------------------------------ #

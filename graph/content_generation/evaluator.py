@@ -1,3 +1,4 @@
+# graph/content_generation/evaluator.py
 import json
 import re
 from typing import Dict, Any
@@ -12,7 +13,6 @@ class EvaluationSchema(BaseModel):
 
 def content_evaluator_node(state: VedState, get_llm) -> Dict[str, Any]:
     """Path B: Evaluator Stage.
-    
     Scores the draft asset under strict temperature constraints and determines 
     if research or rewrite pathways should execute.
     """
@@ -49,10 +49,12 @@ def content_evaluator_node(state: VedState, get_llm) -> Dict[str, Any]:
             critique = "Critique generation failed during fallback parsing parsing protocols."
             search = False
 
+    # Route to Path C if external validation is explicitly flagged by the schema
     next_route = "C" if search else "B"
+    
     return {
         "content_score": score,
         "critique_notes": critique,
-        "route_intent": next_route,
-        "loop_count": state.loop_count + 1
+        "route_intent": next_route
+        # FIXED: Removed internal loop_count increment to prevent dual-increment tracking bugs
     }
