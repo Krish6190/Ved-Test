@@ -23,6 +23,7 @@ class VedWidget(VedComponentLayout):
 
         input_frame = self._build_ui_layout(self._on_mode_click)
         self.voice = VoiceSystem(self.root, input_frame, self.input_entry, self._on_enter)
+        self.input_entry.pack(side="left", fill="both", expand=True, padx=5, pady=10)
         
         self.input_entry.bind("<Return>", lambda ev: [threading.Thread(target=self._send_command, daemon=True).start() if not self.is_generating else None, "break"])
         self._hide_from_screen_capture()

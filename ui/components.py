@@ -60,8 +60,6 @@ class VedComponentLayout(VedWindowBase):
         input_frame.pack_propagate(False)
 
         self.input_entry = tk.Text(input_frame, bg="#313244", fg="#cdd6f4", insertbackground="white", bd=0, font=("Arial", 11), wrap="word", padx=8, pady=2)
-        self.input_entry.pack(side="left", fill="both", expand=True, padx=5, pady=10)
-
         # 5. Output Canvas and Sticky Headers
         self.content_frame = tk.Frame(self.root, bg="#090a0f")
         self.content_frame.pack(side="top", fill="both", expand=True, padx=10, pady=(8, 4))
