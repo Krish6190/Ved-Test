@@ -88,8 +88,8 @@ class Chatbot(ChatbotCommandProcessor):
                 initial_messages = [SystemMessage(content=adapter.system_prompt)]
                 for pair in pinned_memories:
                     if isinstance(pair, dict):
-                        initial_messages.append(HumanMessage(content=pair.get("user", ""), additional_kwargs={"pinned": True}))
-                        initial_messages.append(AIMessage(content=pair.get("assistant", ""), additional_kwargs={"pinned": True}))
+                        initial_messages.append(HumanMessage(content=pair.get("user", "")))
+                        initial_messages.append(AIMessage(content=pair.get("assistant", "")))
                 initial_messages.append(HumanMessage(content=message))
             else:
                 initial_messages = list(self._conversation_history) + [HumanMessage(content=message)]
@@ -104,7 +104,7 @@ class Chatbot(ChatbotCommandProcessor):
                 "loop_count": 0
             }
             token_queue = queue.Queue()
-            config = {"configurable": {"system_prompt": adapter.system_prompt, "token_queue": token_queue}}
+            config = {"configurable": {"system_prompt": adapter.system_prompt, "token_queue": token_queue, "tool_approved": True}}
             last_node_seen = "Unknown"
             accumulated_state = dict(input_state)
             def run_graph():
@@ -157,4 +157,4 @@ class Chatbot(ChatbotCommandProcessor):
         if not path.exists(): return []
         try: return json.loads(path.read_text(encoding="utf-8"))
         except Exception: return []
-    def _save_pinned_contents(self, contents: list): self._get_memory_filepath().write_text(json.dumps(contents, indent=2), encoding="utf-8")
+    def _save_pinned_contents(self, contents: list): self._get_memory_filepath().write_text(json.dumps(contents), encoding="utf-8")

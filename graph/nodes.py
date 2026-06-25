@@ -4,6 +4,8 @@ from typing import Literal
 from langchain_core.messages import AIMessage, SystemMessage, HumanMessage
 from .state import VedState
 from langchain_core.runnables import RunnableConfig
+import sys
+import subprocess
 
 def intent_router_node(state: VedState, get_llm) -> dict:
     """Analyzes the user message to determine the optimal workflow path with fallback safety."""
@@ -89,11 +91,17 @@ def chat_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
 
     return {"messages": [AIMessage(content=full_content)], "route_intent": state.route_intent, "mode": state.mode}
 
-def python_tool_node(state: VedState) -> dict:
-    """Temporary placeholder for Path C: Python script executor."""
-    return {
-        "messages": [AIMessage(content="[System Placeholder] Python script path triggered. Flow building in next step.")]
-    }
+def python_tool_node(state: VedState, config: RunnableConfig) -> dict:
+    """Path C Execution Engine: Delegates shell tool execution tasks to our clean tool folder module."""
+    # Append the project root dynamically to avoid module path mismatch faults on startup
+    import sys
+    from pathlib import Path
+    project_root = str(Path(__file__).resolve().parent.parent)
+    if project_root not in sys.path:
+        sys.path.append(project_root)
+        
+    from tools.python_runner import execute_safe_python_block
+    return execute_safe_python_block(state, config)
 
 def coder_chat_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
     """Isolated coding assistant node using Qwen 2.5 Coder 7B with streaming support."""

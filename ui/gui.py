@@ -17,7 +17,7 @@ MODE_COMMANDS = {"/activate coder", "/deactivate coder", "/sleep", "/hibernate",
 class VedWidget(VedRagWorker):
     def __init__(self, root: tk.Tk):
         super().__init__(root)
-        self.chatbot      = Chatbot()
+        self.chatbot = Chatbot()
         self.current_mode = self.chatbot.mode
         self.chat_history = []
         self.is_generating = False
@@ -110,7 +110,22 @@ class VedWidget(VedRagWorker):
             return
 
         try:
-            response_obj  = self.chatbot.respond(prompt)
+            from graph.nodes import intent_router_node
+            from tkinter import messagebox
+            predicted_intent = "A"
+            if prompt.startswith("/") or prompt.startswith("execute"):
+                predicted_intent = "C"
+            if predicted_intent == "C":
+                user_choice = messagebox.askyesno(
+                    title="⚠️ Critical Tool Execution Authorization Requested",
+                    message=f"Ved is requesting administrative permission to run this action:\n\n'{prompt}'\n\nDo you authorize this terminal execution?",
+                    parent=self.root
+                )
+                if not user_choice:
+                    self._append_text("\n[System Notice: Tool execution blocked by human supervisor parameter.]\n", "#f38ba8")
+                    self.is_generating = False
+                    return
+            response_obj = self.chatbot.respond(prompt)
             full_response = self._consume_response(response_obj)
             cleaned = prompt.strip().lower()
             if cleaned in MODE_COMMANDS or cleaned.startswith(("/deactivate coder", "/mode")):
@@ -127,7 +142,6 @@ class VedWidget(VedRagWorker):
 
     def _consume_response(self, response_obj) -> str:
         if isinstance(response_obj, str):
-            # Send directly into our left-aligned formatter
             self._append_text(response_obj, color="")
             return response_obj
             
@@ -135,17 +149,14 @@ class VedWidget(VedRagWorker):
         for event_type, chunk in response_obj:
             if event_type == "token":
                 full_response += chunk
-                # Streams character tokens safely onto the left side
                 self._append_stream_chunk(chunk)
             elif event_type == "error": 
                 self._append_text(f"[System Error]: {chunk}\n", MODE_COLORS["error"])
                 
         if full_response.strip():
-            # Drop a final trailing padding space to step cleanly into the next round
             self._append_text("\n", color="")
             
         return full_response
-
 
 def main():
     root = tk.Tk()

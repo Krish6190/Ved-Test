@@ -23,6 +23,10 @@ def build_graph(get_llm):
         "coder_chat_node",
         lambda state: "python_tool_node" if state.route_intent == "C" else END
     )
+    g.add_conditional_edges(
+        "python_tool_node",
+        lambda state: "coder_chat_node" if state.mode == "coder" else "chat_node"
+    )
     g.add_edge("chat_node", END)
     g.add_edge("content_pipeline_node", END)
     g.add_edge("python_tool_node", END)

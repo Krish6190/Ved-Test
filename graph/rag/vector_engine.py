@@ -3,7 +3,6 @@ import pickle
 import numpy as np
 from langchain_ollama import OllamaEmbeddings
 from .rag_parser import RagDocumentParser
-from .rag_network import fetch_ollama_vector
 from .rag_maths import compute_top_k
 
 class LocalVectorDB:
@@ -17,7 +16,7 @@ class LocalVectorDB:
         )
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
         self.registry = []
-        self.vectors_matrix = None  # Pre-allocated 2D matrix for instant SIMD math
+        self.vectors_matrix = None  
         self._load_database()
 
     def _load_database(self):
@@ -32,7 +31,9 @@ class LocalVectorDB:
                     else:
                         self.registry = data
                         if data:
-                            self.vectors_matrix = np.array([r["embedding"] for r in data], dtype=np.float32)
+                            valid_vectors = [r["embedding"] for r in data if "embedding" in r]
+                            if valid_vectors:
+                                self.vectors_matrix = np.array(valid_vectors, dtype=np.float32)
             except Exception as e:
                 print(f"[RAG Engine] Binary cache reading warning: {e}")
 
