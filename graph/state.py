@@ -30,7 +30,7 @@ def limit_messages(left: Sequence[BaseMessage], right: Sequence[BaseMessage]) ->
     return pinned_messages + recent_messages
 
 class VedState(BaseModel):
-    messages: Annotated[Sequence[BaseMessage], limit_messages] 
+    messages: Annotated[Sequence[BaseMessage], limit_messages]
     route_intent: Literal["A", "B", "C", ""] = Field(default="")
     current_draft: str = Field(default="")
     critique_notes: str = Field(default="")
@@ -38,3 +38,7 @@ class VedState(BaseModel):
     loop_count: int = Field(default=0)
     mode: str = Field(default="standard")
     saved_memories: list = Field(default_factory=list)
+    # Web search signal (set by Path B evaluator when more external context is needed)
+    # and the results fetched in response. Path A reads/writes these too via chat_node.
+    web_search_needed: bool = Field(default=False)
+    web_search_results: list = Field(default_factory=list)

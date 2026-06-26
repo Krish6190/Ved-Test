@@ -22,11 +22,12 @@ class VedComponentLayout(VedWindowBase):
         super().__init__(root)
         self.mode_buttons      = {}
         self._drag_block_widgets = []
+        self.thread_tab_buttons = {}
 
-    def _build_ui_layout(self, mode_click_cb):
+    def _build_ui_layout(self, mode_click_cb, thread_callbacks=None):
         self._build_title_bar(mode_click_cb)
         input_frame = self._build_input_bar()
-        self._build_content_area()
+        self._build_content_area(thread_callbacks=thread_callbacks)
         return input_frame
     # ------------------------------------------------------------------ #
     # Title bar
@@ -111,11 +112,18 @@ class VedComponentLayout(VedWindowBase):
     # ------------------------------------------------------------------ #
     # Content area (header + output text + scrollbar)
     # ------------------------------------------------------------------ #
-    def _build_content_area(self):
+    def _build_content_area(self, thread_callbacks=None):
         self.content_frame = tk.Frame(self.root, bg="#090a0f")
         self.content_frame.pack(side="top", fill="both", expand=True, padx=10, pady=(8, 4))
 
         self.line_height = tkfont.Font(font=("Arial", 12)).metrics("linespace")
+
+        if thread_callbacks is not None:
+            self._build_thread_tabs(
+                self.content_frame,
+                thread_callbacks["on_switch"],
+                thread_callbacks["on_new"],
+            )
 
         header_frame = tk.Frame(self.content_frame, bg="#090a0f")
         header_frame.pack(side="top", fill="x", pady=(0, 4))
@@ -143,3 +151,62 @@ class VedComponentLayout(VedWindowBase):
         self.output_scroll = tk.Scrollbar(self.content_frame, command=self.output_text.yview)
         self.output_scroll.pack(side="right", fill="y")
         self.output_text.configure(yscrollcommand=self.output_scroll.set)
+    # ------------------------------------------------------------------ #
+    # Thread tab strip (populated by GUI's _refresh_thread_tabs)
+    # ------------------------------------------------------------------ #
+    def _build_thread_tabs(self, tabs_parent, on_thread_click, on_new_thread_click):
+        """Builds the thread-tab strip container plus the trailing '+' button.
+        The per-thread pill buttons are added later by the GUI via
+        _refresh_thread_tabs, which also stores them in self.thread_tab_buttons.
+        """
+        self.thread_tabs_frame = tk.Frame(tabs_parent, bg="#090a0f")
+        self.thread_tabs_frame.pack(side="top", fill="x", pady=(0, 4))
+        self.thread_tab_buttons = {}
+
+        new_btn = tk.Label(
+            self.thread_tabs_frame, text="＋", bg="#1e2030", fg="#a6e3a1",
+            font=("Arial", 12, "bold"), padx=8, pady=2, cursor="hand2", bd=0
+        )
+        new_btn.pack(side="right", padx=(4, 0))
+        new_btn.bind("<Button-1>", lambda ev, cb=on_new_thread_click: cb())
+        new_btn.bind("<B1-Motion>", lambda ev: "break")
+        self._drag_block_widgets.append(new_btn)
+
+    def _build_single_thread_tab(self, parent, thread_id, title, is_active,
+                                 on_switch, on_delete):
+        """Creates one pill-style thread tab (title + close '×') inside `parent`.
+        Returns the tab Frame; caller stores it in self.thread_tab_buttons."""
+        bg = "#313244" if is_active else "#161b26"
+        fg = "#e5e9f0" if is_active else "#a6adc8"
+        tab = tk.Frame(parent, bg=bg, bd=0, cursor="hand2")
+        tab.pack(side="left", padx=(0, 4))
+
+        display_title = (title or "New Thread")[:18]
+        title_lbl = tk.Label(
+            tab, text=display_title, bg=bg, fg=fg,
+            font=("Segoe UI", 9, "bold"), padx=8, pady=2
+        )
+        title_lbl.pack(side="left")
+
+        close_lbl = tk.Label(
+            tab, text="×", bg=bg, fg=("#f38ba8" if is_active else "#6c7086"),
+            font=("Arial", 10, "bold"), padx=4, pady=2, cursor="hand2"
+        )
+        close_lbl.pack(side="left")
+
+        for w in (tab, title_lbl, close_lbl):
+            w.bind("<B1-Motion>", lambda ev: "break")
+            self._drag_block_widgets.append(w)
+
+        def _switch(ev, tid=thread_id):
+            if on_switch:
+                on_switch(tid)
+        tab.bind("<Button-1>", _switch)
+        title_lbl.bind("<Button-1>", _switch)
+
+        def _delete(ev, tid=thread_id):
+            if on_delete:
+                on_delete(tid)
+        close_lbl.bind("<Button-1>", _delete)
+
+        return tab

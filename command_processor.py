@@ -12,7 +12,7 @@ class ChatbotCommandProcessor:
                 return "Coder Mode Active. Specialized Qwen 2.5 Coder 7B preloaded on GPU."
             except Exception as e:
                 return f"Failed to activate coder mode: {e}"
-                
+
         if cmd.startswith("/deactivate coder"):
             if self.mode != "coder":
                 return "Coder mode is not currently active."
@@ -44,7 +44,10 @@ class ChatbotCommandProcessor:
                 return f"Mode set to {parts[1]}."
             return f"Usage: /mode [{'|'.join(MODES)}]"
 
-        return self._handle_memory_commands(cmd)
+        mem_resp = self._handle_memory_commands(cmd)
+        if mem_resp is not None:
+            return mem_resp
+        return self._handle_thread_commands(message)
 
     def _handle_memory_commands(self, cmd: str) -> str | None:
         if cmd == "pin":
@@ -90,5 +93,115 @@ class ChatbotCommandProcessor:
             if not saved: return "Long term context storage is empty."
             lines = [f"{i+1}. {item.get('user', '')[:60]}..." if isinstance(item, dict) else f"{i+1}. {str(item)[:60]}..." for i, item in enumerate(saved)]
             return "Pinned Memories (Prompts):\n" + "\n".join(lines)
+
+        return None
+
+    def _resolve_thread_ref(self, ref: str):
+        threads = self.list_threads()
+        if not threads:
+            return None
+        if ref is None or ref == "":
+            return self._active_thread_id
+        if ref.isdigit():
+            idx = int(ref) - 1
+            if 0 <= idx < len(threads):
+                return threads[idx]["id"]
+            return None
+        for t in threads:
+            if t["id"] == ref or t["id"].startswith(ref):
+                return t["id"]
+        return None
+
+    def _handle_thread_commands(self, message: str) -> str | None:
+        raw = message.strip()
+        lower = raw.lower()
+        if lower == "/new":
+            new_id = self.create_thread()
+            return f"Created thread {new_id}."
+        if lower.startswith("/new "):
+            title = raw[5:].strip()
+            if not title:
+                title = None
+            new_id = self.create_thread(title)
+            return f"Created thread {new_id} ({title})." if title else f"Created thread {new_id}."
+        if lower in ("/threads", "/list_threads"):
+            threads = self.list_threads()
+            if not threads:
+                return "No threads."
+            lines = []
+            for i, t in enumerate(threads, start=1):
+                marker = "* " if t["id"] == self._active_thread_id else "  "
+                title_display = t["title"][:30] if t["title"] else "(untitled)"
+                lines.append(f"{marker}{i}. {t['id']}  {title_display}")
+            return "Threads:\n" + "\n".join(lines)
+        if lower.startswith("/switch"):
+            parts = raw.split(maxsplit=1)
+            if len(parts) < 2:
+                return "Usage: /switch <id|number>"
+            target = self._resolve_thread_ref(parts[1].strip())
+            if target is None:
+                return f"Unknown thread: {parts[1].strip()}"
+            self.switch_thread(target)
+            return f"Switched to thread {target}."
+        if lower.startswith("/rename"):
+            parts = raw.split(maxsplit=1)
+            if len(parts) < 2 or not parts[1].strip():
+                return "Usage: /rename <new_title>"
+            if not self._active_thread_id:
+                return "No active thread."
+            self.rename_thread(self._active_thread_id, parts[1].strip())
+            return f"Renamed thread to: {parts[1].strip()}"
+        if lower.startswith("/delete"):
+            parts = raw.split(maxsplit=1)
+            if len(parts) < 2:
+                target = self._active_thread_id
+            else:
+                target = self._resolve_thread_ref(parts[1].strip())
+            if target is None:
+                return f"Unknown thread: {parts[1].strip()}"
+            if len(self._threads) <= 1:
+                return "Cannot delete the last remaining thread."
+            if not self.delete_thread(target):
+                return f"Failed to delete thread {target}."
+            return f"Deleted thread {target}."
+        if lower == "/clear":
+            if not self._active_thread_id or self._active_thread_id not in self._threads:
+                return "No active thread."
+            self._threads[self._active_thread_id]["messages"] = []
+            self._save_threads()
+            return "Cleared active thread messages."
+
+        # /upload-global — add a file to the private global store (no thread scope).
+        # Only reachable via the input bar, so only the local user can populate it.
+        if cmd == "/upload-global":
+            from tkinter import filedialog
+            supported = [(
+                "Parsable Assets",
+                "*.txt *.md *.pdf *.docx *.doc "
+                "*.py *.js *.jsx *.ts *.tsx "
+                "*.java *.go *.rs *.rb *.php *.cs "
+                "*.cpp *.c *.h *.hpp *.swift *.kt *.scala "
+                "*.sh *.bash *.zsh *.ps1 "
+                "*.html *.css *.scss *.xml *.svg "
+                "*.json *.yaml *.yml *.toml *.csv *.sql "
+                "*.log *.zip"
+            )]
+            chosen = filedialog.askopenfilename(
+                title="Attach File to Global Store",
+                filetypes=supported,
+            )
+            if not chosen:
+                return "(global upload cancelled)"
+            try:
+                meta = self.add_global_file(chosen)
+            except FileNotFoundError as e:
+                return f"[System Upload Rejected]: {e}"
+            except Exception as e:
+                return f"[System Upload Failure]: {e}"
+            evicted = meta.get("evicted", [])
+            msg = f"[Attached to global]: {meta['filename']} ({meta['chunk_count']} chunks)"
+            if evicted:
+                msg += f" — evicted {len(evicted)} oldest upload(s) to make room"
+            return msg
 
         return None

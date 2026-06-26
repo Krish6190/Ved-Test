@@ -15,7 +15,7 @@ def compute_top_k(query_vector: list, registry_records: list, db_embeddings: np.
 
     if len(registry_records) <= k:
         sorted_indices = np.argsort(similarities)[::-1]
-        return [{"score": float(similarities[idx]), "content": registry_records[idx]["content"]} for idx in sorted_indices]
+        return [_entry(registry_records[idx], similarities[idx]) for idx in sorted_indices]
 
     selected_indices = []
     unselected_indices = list(range(len(registry_records)))
@@ -46,4 +46,17 @@ def compute_top_k(query_vector: list, registry_records: list, db_embeddings: np.
         selected_indices.append(actual_winner_idx)
         unselected_indices.remove(actual_winner_idx)
 
-    return [{"score": float(similarities[idx]), "content": registry_records[idx]["content"]} for idx in selected_indices]
+    return [_entry(registry_records[idx], similarities[idx]) for idx in selected_indices]
+
+
+def _entry(record: dict, score) -> dict:
+    """Build a retrieval-result dict from a registry record + similarity score.
+
+    Excludes the bulky `embedding` vector — callers don't need it.
+    """
+    return {
+        "score": float(score),
+        "content": record.get("content", ""),
+        "source": record.get("source", "unknown"),
+        "scope": record.get("scope", "__GLOBAL__"),
+    }

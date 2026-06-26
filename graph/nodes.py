@@ -8,59 +8,61 @@ import sys
 import subprocess
 
 def intent_router_node(state: VedState, get_llm) -> dict:
-    """Analyzes the user message to determine the optimal workflow path with fallback safety."""
+    """Route the user message to Path A (chat + RAG + web), B (content generation),
+    or C (tool execution). Pure heuristic router — no LLM call, so routing is
+    deterministic, fast, and easy to debug.
+
+    Rules (evaluated top-down, first match wins):
+      1. Explicit override:  "... path A|B|C"  anywhere in the message
+      2. Slash commands: any "/..."           → A (commands handled separately)
+      3. Tool execution: "/run ..." or "execute ..."  → C
+      4. File/tool verbs: "read this file", "open this file", "perform this"  → C
+      5. Word-count spec:  "<N> word(s)/paragraph(s)/page(s)..."  → B
+      6. Generation verb at start: "write/draft/compose/generate/create/make/build ..."  → B
+      7. Generation phrases anywhere: "write me", "essay on", "blog post", etc.  → B
+      8. Default: A
+    """
     user_messages = [msg for msg in state.messages if isinstance(msg, HumanMessage)]
     last_user_text = user_messages[-1].content.strip() if user_messages else ""
     lower_text = last_user_text.lower()
-    
-    # 1. Fast Keyword/Regex Intercept Layers (Instant response, zero LLM latency)
-    content_triggers = ["generate", "write me", "draft", "compose", "summarize", "summary of"]
-    if any(trigger in lower_text for trigger in content_triggers):
-        return {"route_intent": "B"}
-    if lower_text.startswith("/run") or lower_text.startswith("execute"):
-        return {"route_intent": "C"}
-        
-    llm = get_llm()
-    if llm is None: 
+
+    # 1. Explicit override ("use path A" / "path B" etc.).
+    override = re.search(r"\b(?:use\s+)?path\s+([abc])\b", lower_text)
+    if override:
+        return {"route_intent": override.group(1).upper()}
+
+    # 2. Slash commands are handled separately by command_processor; never run through graph nodes.
+    if lower_text.startswith("/"):
         return {"route_intent": "A"}
 
-    # 2. Complete, Unabridged Prompt System to Guard Decision Quality
-    router_prompt = (
-        "You are a strict request classifier. Your sole job is to classify the user message into exactly one route.\n\n"
-        "THE PROTOCOLS:\n"
-        "Route A: ANY question asking 'what is', 'how does', 'explain', meanings, definitions, terminology, conceptual breakdowns, "
-        "informational queries, status updates, greetings, small talk, or standard back-and-forth conversation. When in doubt, choose A.\n"
-        "Route B: Explicit requests to generate, draft, compile, or write long-form assets (e.g., 'write an essay', 'compose a letter', "
-        "'draft a multi-paragraph blog article', 'generate a full report') of any size.\n"
-        "Route C: Explicit standalone requests to run commands, execute local files, launch sandboxed scripts, or compile code lines "
-        "inside the workspace terminal boundaries.\n\n"
-        "EXAMPLES:\n"
-        "- 'hey' -> A\n"
-        "- 'my name is John' -> A\n"
-        "- 'what is Python' -> A\n"
-        "- 'write me a 1000 word essay on climate change' -> B\n"
-        "- 'draft a formal letter to my landlord' -> B\n"
-        "- 'generate a sales report' -> B\n"
-        "- 'run this script' -> C\n"
-        "- 'execute the command ls -la' -> C\n"
-        "- 'open browser then go to https://whatsappweb.com' -> C\n"
-        "- 'Text shivam to say I will be late' -> A\n\n"
-        f"User message: '{last_user_text}'\n\n"
-        "OUTPUT FORMAT RULE:\n"
-        "Reply with ONLY a single character: A, B, or C. Do not output any markdown, explanations, or surrounding text."
+    # 3. Tool execution — explicit command forms.
+    if lower_text.startswith("/run") or lower_text.startswith("execute"):
+        return {"route_intent": "C"}
+
+    # 4. File/tool operation verbs — only if it doesn't look like a question.
+    if not re.search(r"\b(what|how|why|when|where|who|which)\b", lower_text):
+        if re.match(r"^(read|open|run|execute|perform|launch|start|invoke)\s+", lower_text):
+            return {"route_intent": "C"}
+
+    # 5. Specific length specifiers — almost always generation.
+    if re.search(r"\b\d+\s+(word|words|paragraph|paragraphs|page|pages|line|lines|char|chars|character|characters)\b", lower_text):
+        return {"route_intent": "B"}
+
+    # 6. Generation verbs at the start of the message.
+    if re.match(r"^(write|draft|compose|generate|create|make|build|craft|author|produce)\s+", lower_text):
+        return {"route_intent": "B"}
+
+    # 7. Generation phrases anywhere in the message.
+    generation_phrases = (
+        "write me", "write a", "write an", "draft a", "draft an",
+        "compose a", "essay on", "essay about", "blog post",
+        "story about", "letter to", "report on", "summary of", "summarize",
     )
-    
-    try:
-        # Direct raw token invocation avoids structured tool loops entirely
-        raw_res = llm.invoke([SystemMessage(content=router_prompt)]).content.strip().upper()
-        
-        # Robust regex fallback wrapper: looks for the first standalone A, B, or C in the response
-        match = re.search(r"\b([A-C])\b", raw_res)
-        chosen_route = match.group(1) if match else "A"
-    except Exception:
-        chosen_route = "A"
-        
-    return {"route_intent": chosen_route}
+    if any(p in lower_text for p in generation_phrases):
+        return {"route_intent": "B"}
+
+    # 8. Default: Path A (chat + RAG + web).
+    return {"route_intent": "A"}
 
 def chat_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
     """Conversational chat node handling Path A with real-time streaming hooks."""
@@ -82,8 +84,36 @@ def chat_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
         token_queue = config["configurable"]["token_queue"]
     except (KeyError, TypeError):
         token_queue = None
-    
-    for chunk in llm.stream(state.messages):
+
+    # Dual-source RAG: thread + global, with priority fallback. Silent on empty.
+    active_thread_id = None
+    if config and isinstance(config.get("configurable"), dict):
+        active_thread_id = config["configurable"].get("active_thread_id")
+    user_messages = [msg for msg in state.messages if isinstance(msg, HumanMessage)]
+    last_user_text = user_messages[-1].content.strip() if user_messages else ""
+    messages_to_stream = list(state.messages)
+    if last_user_text:
+        context_block = ""
+        try:
+            from graph.rag.mixer import retrieve_context, _format_rag_block
+            rag_chunks = retrieve_context(last_user_text, active_thread_id, k=5)
+            if rag_chunks:
+                context_block = _format_rag_block(rag_chunks)
+        except Exception:
+            pass  # RAG is optional; never block chat on a retrieval failure
+        if not context_block:
+            # RAG had nothing useful — try DuckDuckGo before falling back to bare prompt.
+            try:
+                from graph.tools.web_search import web_search, format_web_results_block
+                web_results = web_search(last_user_text, max_results=5)
+                if web_results:
+                    context_block = format_web_results_block(web_results)
+            except Exception:
+                pass
+        if context_block:
+            messages_to_stream = [SystemMessage(content=context_block)] + messages_to_stream
+
+    for chunk in llm.stream(messages_to_stream):
         if chunk.content:
             full_content += chunk.content
             if token_queue:

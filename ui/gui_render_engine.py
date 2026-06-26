@@ -131,6 +131,10 @@ class VedGuiRenderEngine(VedComponentLayout):
             self._resize_to_fit_content()
         self.root.after(0, action)
 
+    def _clear_output(self):
+        """Wipes the chat log output cleanly so a thread switch starts blank."""
+        self.output_text.delete("1.0", "end")
+
     def _render_chat_history(self):
         """Flushes the log viewer screen cleanly and processes memory history frames."""
         self.output_text.delete("1.0", "end")

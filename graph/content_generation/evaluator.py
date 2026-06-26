@@ -58,10 +58,11 @@ def content_evaluator_node(state: VedState, get_llm) -> Dict[str, Any]:
 
     # Route to Path C if external validation is explicitly flagged by the schema
     next_route = "C" if search else "B"
-    
+
     return {
         "content_score": score,
         "critique_notes": critique,
-        "route_intent": next_route
+        "route_intent": next_route,
+        "web_search_needed": search,
         # FIXED: Removed internal loop_count increment to prevent dual-increment tracking bugs
     }
