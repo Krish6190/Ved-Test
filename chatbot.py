@@ -45,18 +45,32 @@ def _serialize_message(msg) -> dict:
         role = "system"
     else:
         role = cls_name.lower()
-    return {"role": role, "content": msg.content}
+    out = {"role": role, "content": msg.content}
+    # Preserve additional_kwargs (e.g., "pinned": True so FIFO doesn't drop pinned turns).
+    extra = getattr(msg, "additional_kwargs", None)
+    if extra:
+        out["additional_kwargs"] = dict(extra)
+    return out
 
 def _deserialize_message(data: dict) -> BaseMessage:
     role = data.get("role", "")
     content = data.get("content", "")
+    extra = data.get("additional_kwargs") or {}
     if role == "human":
-        return HumanMessage(content=content)
-    if role == "ai":
-        return AIMessage(content=content)
-    if role == "system":
-        return SystemMessage(content=content)
-    return HumanMessage(content=content)
+        msg = HumanMessage(content=content)
+    elif role == "ai":
+        msg = AIMessage(content=content)
+    elif role == "system":
+        msg = SystemMessage(content=content)
+    else:
+        msg = HumanMessage(content=content)
+    if extra:
+        # Restore pinned flag (and any future additional_kwargs) on reload.
+        try:
+            msg.additional_kwargs.update(extra)
+        except Exception:
+            pass
+    return msg
 
 class Chatbot(ChatbotCommandProcessor):
     def __init__(self, mode=None):

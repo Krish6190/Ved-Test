@@ -206,8 +206,11 @@ class VedWidget(VedRagWorker):
             "/wake",
             "/resume",
             "/upload-global",
-            "/run <script>",
-            "/pin <user|assistant|list|unpin|unpin_all>",
+            "/run",
+            "/pin",
+            "/unpin <n>",
+            "/unpin_all",
+            "/list",
             "/memories",
         ]
 

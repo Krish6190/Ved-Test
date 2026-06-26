@@ -1,5 +1,5 @@
 _____________________________________________________________
 TODO LIST:
 _____________________________________________________________
-
-1)START WORKING ON TOOLS
+1)Switch to js thik tk really sucks
+2)START WORKING ON TOOLS

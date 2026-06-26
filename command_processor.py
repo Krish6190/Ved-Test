@@ -1,4 +1,6 @@
 import os
+import sys
+import subprocess
 import requests
 from langchain_core.messages import HumanMessage, AIMessage
 from __init__ import MODES
@@ -50,7 +52,7 @@ class ChatbotCommandProcessor:
         return self._handle_thread_commands(message)
 
     def _handle_memory_commands(self, cmd: str) -> str | None:
-        if cmd == "pin":
+        if cmd == "/pin":
             user_msgs = [m for m in self._conversation_history if isinstance(m, HumanMessage)]
             ai_msgs = [m for m in self._conversation_history if isinstance(m, AIMessage)]
             if not user_msgs or not ai_msgs:
@@ -66,33 +68,82 @@ class ChatbotCommandProcessor:
             for m in reversed(self._conversation_history):
                 if m.content in [last_user_text, last_ai_text]:
                     m.additional_kwargs["pinned"] = True
+            self._save_threads()
             return f"Success: Pinned turn sequence. ({len(saved)}/20 occupied)"
 
-        if cmd == "unpin_all":
+        if cmd == "/unpin_all":
             self._save_pinned_contents([])
             for m in self._conversation_history:
-                if "pinned" in m.additional_kwargs: m.additional_kwargs["pinned"] = False
+                if "pinned" in m.additional_kwargs:
+                    m.additional_kwargs["pinned"] = False
+            self._save_threads()
             return "Cleared all long-term memory pins."
 
-        if cmd.startswith("unpin "):
+        if cmd.startswith("/unpin "):
             try:
                 idx = int(cmd.split()[1]) - 1
                 saved = self._load_pinned_contents()
-                if idx < 0 or idx >= len(saved): return f"Index error. Range 1 to {len(saved)}."
+                if idx < 0 or idx >= len(saved):
+                    return f"Index error. Range 1 to {len(saved)}."
                 removed_pair = saved.pop(idx)
                 self._save_pinned_contents(saved)
                 if isinstance(removed_pair, dict):
                     rem_user, rem_ai = removed_pair.get("user", ""), removed_pair.get("assistant", "")
                     for m in self._conversation_history:
-                        if m.content in [rem_user, rem_ai]: m.additional_kwargs["pinned"] = False
+                        if m.content in [rem_user, rem_ai]:
+                            m.additional_kwargs["pinned"] = False
+                self._save_threads()
                 return f"Unpinned memory element {idx + 1}."
-            except (ValueError, IndexError): return "Usage error. Format: unpin <integer_index>"
+            except (ValueError, IndexError):
+                return "Usage error. Format: /unpin <integer_index>"
 
-        if cmd == "list":
+        if cmd in ("/list", "/memories"):
             saved = self._load_pinned_contents()
-            if not saved: return "Long term context storage is empty."
-            lines = [f"{i+1}. {item.get('user', '')[:60]}..." if isinstance(item, dict) else f"{i+1}. {str(item)[:60]}..." for i, item in enumerate(saved)]
+            if not saved:
+                return "Long term context storage is empty."
+            lines = [
+                f"{i+1}. {item.get('user', '')[:60]}..."
+                if isinstance(item, dict)
+                else f"{i+1}. {str(item)[:60]}..."
+                for i, item in enumerate(saved)
+            ]
             return "Pinned Memories (Prompts):\n" + "\n".join(lines)
+
+        if cmd == "/run":
+            # Open file dialog → confirm → execute script via subprocess.
+            from tkinter import filedialog, messagebox
+            chosen = filedialog.askopenfilename(
+                title="Select Python Script to Run",
+                filetypes=[("Python Scripts", "*.py"), ("All Files", "*.*")],
+            )
+            if not chosen:
+                return "(run cancelled)"
+            proceed = messagebox.askyesno(
+                title="⚠️ Confirm Script Execution",
+                message=(
+                    f"Run this script?\n\n{chosen}\n\n"
+                    "Script execution can modify files or make network calls. Continue?"
+                ),
+            )
+            if not proceed:
+                return "(run cancelled by user)"
+            try:
+                result = subprocess.run(
+                    [sys.executable, chosen],
+                    capture_output=True, text=True, timeout=30,
+                )
+                output = result.stdout or ""
+                if result.stderr:
+                    output += "\n[stderr]:\n" + result.stderr
+                if result.returncode != 0:
+                    output += f"\n[exit code {result.returncode}]"
+                if not output:
+                    output = "(script produced no output)"
+                return f"Script output ({os.path.basename(chosen)}):\n{output[:2000]}"
+            except subprocess.TimeoutExpired:
+                return f"Script timed out after 30 seconds: {chosen}"
+            except Exception as e:
+                return f"Script failed: {e}"
 
         return None
 
