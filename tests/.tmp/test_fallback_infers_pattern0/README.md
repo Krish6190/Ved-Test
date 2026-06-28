@@ -1,3 +1,0 @@
-# Test README
-
-Hello world.
