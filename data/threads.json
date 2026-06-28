@@ -75,6 +75,14 @@
       {
         "role": "ai",
         "content": "Here is the content of the README file:\n\n```\n# Ved — Local Multi-Format Offline AI Agent\n\nA highly decoupled, resource-constrained AI Agent architecture running 100% offline within a strict 4GB VRAM / 16GB RAM hardware footprint. Features deterministic model switching loops, an isolated graphics-accelerated coding lane, and sticky-viewport desktop interface layers.\n\n## Core Project Architecture Directory\n- `__main__.py` — Application bootstrapper. Run with: `python __main__.py`\n- `__init__.py` — Global configurations and hardware execution mode registers.\n- `chatbot.py` — Core orchestration engine handling graph input/output loops.\n- `command_processor.py` — Isolated non-LLM text command mixin matrix.\n- `model_adapter.py` — Low-level ChatOllama integration configuration parser.\n- `Modelfile.*` — Per-mode Ollama engine configuration settings profiles.\n- `data/` — Local text cache stores (`memories.json` and `long_term_memory.json`).\n- `graph/` — LangGraph orchestration workspace state machine pipelines.\n  - `nodes.py` — Path A & Coder node workflow routing conditions logic.\n  - `state.py` — Pydantic models and context window memory limit reducers.\n- `ui/` — Modular window construction and layout interface components.\n  - `window_base.py` — Screen capture shields and desktop window positioning rules.\n  - `components.py` — Stationary headers and visual widget packing loops.\n  - `gui.py` — Asynchronous thread event triggers and screen updates.\n- `voice/` — Offline fast whisper speech transcription and Piper synthesis pipelines.\n  - `assets/` — Local sound files, voice files, and audio assets.\n```"
+      },
+      {
+        "role": "human",
+        "content": "Hello. You."
+      },
+      {
+        "role": "ai",
+        "content": "Please provide a file name or path, and I'll be happy to read it for you.\n\n(If you need help with anything else, feel free to ask!)"
       }
     ]
   },

@@ -33,7 +33,7 @@ class VedWidget(VedRagWorker):
         input_frame = self._build_ui_layout(self._on_mode_click, thread_callbacks=self.thread_callbacks)
         self.input_frame = input_frame
         self._build_approval_bar()
-        self.voice  = VoiceSystem(self.root, input_frame, self.input_entry, self._on_enter)
+        self.voice  = VoiceSystem(self.root, input_frame, self.input_entry, self._send_command)
         self.input_entry.pack(side="left", fill="both", expand=True, padx=5, pady=10)
 
         if hasattr(self, "upload_btn") and self.upload_btn:
@@ -303,8 +303,23 @@ class VedWidget(VedRagWorker):
         except Exception as e:
             self._append_text(f"[System Error] Failed to submit approval: {e}\n", MODE_COLORS["error"])
 
-    def _send_command(self):
-        prompt = self.input_entry.get("1.0", tk.END).strip()
+    def _send_command(self, prompt=None):
+        # Chunk C: an optional explicit prompt arg lets the voice processor
+        # call this method synchronously via self.send_command(None). When the
+        # arg is None we read from the input box (the original Enter-key path).
+        if prompt is None:
+            prompt = self.input_entry.get("1.0", tk.END).strip()
+
+        # Chunk C: interrupt any in-flight bot-response speech so the new
+        # prompt gets clean audio (and so the user immediately hears the
+        # cutoff, not a 5-second tail of the previous reply).
+        voice = getattr(self, "voice", None)
+        if voice is not None and hasattr(voice, "stop_tts"):
+            try:
+                voice.stop_tts()
+            except Exception:
+                pass
+
         # Drain pending attachments up front so the UI clears even on early returns.
         pending = list(self.pending_attachments)
         self.pending_attachments.clear()
@@ -429,8 +444,17 @@ class VedWidget(VedRagWorker):
             if isinstance(response_obj, str):
                 self.root.after(0, self._refresh_thread_tabs)
                 self.root.after(0, self._render_active_thread)
+            # Chunk C: return the assembled response string so the voice path
+            # can speak it via the interruptible TTS. Returning from inside
+            # the try block is fine — the `finally` below still runs and
+            # cleans up `is_generating` and focus.
+            return full_response
         except Exception as e:
             self._append_text(f"\nChatbot error: {e}\n", MODE_COLORS["error"])
+            # Chunk C: return an empty string so the voice path doesn't try
+            # to speak the error text. `_reset_to_wake_word` is still called
+            # by the audio processor regardless of what we return.
+            return ""
         finally:
             self.is_generating = False
             self.root.after(0, lambda: self.input_entry.focus())

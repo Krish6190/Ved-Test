@@ -1,5 +1,14 @@
 import tkinter as tk
+import time
 import numpy as np
+
+def _matches_any(text: str, keywords: list[str]) -> bool:
+    """Tokenize text and return True if any token equals or contains a keyword."""
+    if not text:
+        return False
+    words = text.lower().replace(',', '').replace('.', '').split()
+    lower_text = text.lower()
+    return any(kw in words or kw in lower_text for kw in keywords)
 
 def _process_captured_audio(self, chunks, talked, fs, stream):
     self.root.after(0, lambda: self.mic_button.config(text="🎙", fg="#a6adc8"))
@@ -18,7 +27,7 @@ def _process_captured_audio(self, chunks, talked, fs, stream):
             beam_size=3, 
             language="en", 
             vad_filter=True, 
-            vad_parameters=dict(min_speech_duration_ms=50),
+            vad_parameters=dict(min_speech_duration_ms=250),
         )
         text = "".join([segment.text for segment in segments]).strip()
         print(f"[Voice] Recognized text: {text}")
@@ -47,18 +56,20 @@ def _process_initial_prompt_logic(self, text):
     self.pending_text = text
     
     self._say_reply(f"You said: {text}. Should I send this?")
+    time.sleep(0.4)  # grace period so Piper's acoustic tail dies down before mic opens
     self.current_state = "CONFIRMATION"
 
 def _process_confirmation_logic(self, text, stream):
-    words = text.lower().replace(',', '').replace('.', '').split() if text else []
-    
-    confirm_keywords = ["yes", "send", "submit", "execute", "run", "go", "do it", "enter", "correct"]
+    confirm_keywords = [
+        "yes", "yeah", "yep", "yup", "ok", "okay", "sure",
+        "send", "submit", "execute", "run", "go", "do it", "enter", "correct",
+    ]
     cancel_keywords = ["no", "wrong", "stop", "cancel", "don't"]
     repeat_keywords = ["repeat", "again", "say again"]
-    
-    has_confirm = any(word in words for word in confirm_keywords)
-    has_cancel = any(word in words for word in cancel_keywords)
-    has_repeat = any(word in words for word in repeat_keywords)
+
+    has_confirm = _matches_any(text, confirm_keywords)
+    has_cancel = _matches_any(text, cancel_keywords)
+    has_repeat = _matches_any(text, repeat_keywords)
 
     if text == "timeout_keep_text":
         print("[Voice] Confirmation timed out. Keeping text on input bar without sending.")
@@ -66,8 +77,18 @@ def _process_confirmation_logic(self, text, stream):
         self._reset_to_wake_word(stream)
     elif has_confirm:
         print("[Voice] Confirmation positive match heard. Executing pending graph turn...")
-        self._say_reply("Sending.")
-        self.root.after(0, lambda: self.send_command(None))
+        # Chunk C: synchronously capture the bot's response text so we can speak
+        # it via the interruptible TTS path. send_command(None) is bound to
+        # gui._send_command (which now returns full_response); the whole call
+        # blocks this audio-worker thread for the duration of the LLM turn,
+        # then we hand the reply to _say_reply_interruptible (non-blocking)
+        # and finally reset state back to wake-word listening.
+        try:
+            response_text = self.send_command(None)
+            if response_text:
+                self._say_reply_interruptible(response_text)
+        except Exception as e:
+            print(f"[Voice Error] {e}")
         self._reset_to_wake_word(stream)
     elif has_cancel:
         print("[Voice] Execution canceled by user request. Returning to sleep mode.")

@@ -7,13 +7,7 @@ from .state import VedState
 from langchain_core.runnables import RunnableConfig
 import sys
 import subprocess
-
-# Bind the agent's tools to the LLM at import time so chat_node (and any
-# other node that needs tool calling) can simply do `llm.bind_tools(VED_TOOLS)`.
 from graph.tools import VED_TOOLS
-
-# System message injected into chat when the user's request looks complex.
-# It nudges the LLM to plan, but is harmless for short requests.
 _PLANNING_HINT = SystemMessage(content=(
     "You have access to tools (read_file, edit_file, overwrite_file, "
     "search_files, execute_python). Use them when the task needs file I/O "
@@ -23,10 +17,15 @@ _PLANNING_HINT = SystemMessage(content=(
     "step. If a tool returns an error or no result, replan and try a "
     "different approach - do not give up after one failure."
 ))
-
-# System message telling the LLM to reproduce tool output verbatim instead of
-# summarizing. Smaller models (qwen2.5-coder, llama3, etc.) default to being
-# concise and treat tool returns as context to compress — this fights that.
+_TOOL_RESTRAINT_HINT = SystemMessage(content=(
+    "Tool invocation policy: only call a tool (read_file, edit_file, "
+    "overwrite_file, search_files, execute_python, web_search) when the "
+    "user explicitly asks for file I/O, code execution, web search, or "
+    "file search. For greetings, chitchat, knowledge questions, opinions, "
+    "and conversational replies — respond directly with text. Do not call "
+    "a tool speculatively or to 'be helpful' when the user did not request "
+    "it. If unsure whether the user wants a tool, prefer a direct reply."
+))
 _TOOL_OUTPUT_HINT = SystemMessage(content=(
     "When a tool returns content, REPRODUCE IT VERBATIM in your reply. "
     "Do not summarize, paraphrase, or describe what a file contains - "
@@ -180,7 +179,7 @@ def chat_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
     # Always inject the planning + tool-output hints so the LLM knows it has
     # tools, should plan for multi-step work, and must reproduce file/search
     # results verbatim instead of summarizing.
-    messages_to_stream = [_PLANNING_HINT, _TOOL_OUTPUT_HINT] + messages_to_stream
+    messages_to_stream = [_PLANNING_HINT, _TOOL_RESTRAINT_HINT, _TOOL_OUTPUT_HINT] + messages_to_stream
 
     for chunk in llm_with_tools.stream(messages_to_stream):
         # Text content - stream to UI token_queue
