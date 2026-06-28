@@ -19,3 +19,53 @@ A highly decoupled, resource-constrained AI Agent architecture running 100% offl
   - `gui.py` — Asynchronous thread event triggers and screen updates.
 - `voice/` — Offline fast whisper speech transcription and Piper synthesis pipelines.
   - `assets/` — Local sound files, voice files, and audio assets.
+
+## HTTP API
+
+The chatbot is exposed over HTTP via FastAPI so that a React/Node UI can
+talk to the backend without importing any Python. Start the server:
+
+```bash
+.venv/Scripts/python.exe -m uvicorn api.server:app --port 8000
+```
+
+Then point your JS client at `http://127.0.0.1:8000`. The full endpoint
+map and SSE event shape are documented in
+[`.kimchi/docs/fastapi-plan.md`](.kimchi/docs/fastapi-plan.md).
+
+Quick sanity check from another terminal:
+
+```bash
+curl http://127.0.0.1:8000/health
+# {"status":"ok"}
+
+curl -N -X POST http://127.0.0.1:8000/chat -H "Content-Type: application/json" -d '{"prompt":"/threads"}'
+# event: message
+# data: {"text": "Threads:\n  * 1. thr_xxx  New Thread", "session_id": "..."}
+#
+# event: done
+# data: {"session_id": "..."}
+```
+
+A manual end-to-end smoke test against a running server:
+
+```bash
+python api/smoke_test.py
+```
+
+The Tkinter desktop UI (`ui/gui.py`) is unchanged — it still talks to the
+backend directly. The HTTP layer is for the future React frontend and
+any other non-Python client (curl, scripts, mobile).
+
+**Thread-scoped file upload.** `POST /files/thread` ingests a file into
+the *active* thread's RAG store with FIFO eviction when the per-thread
+chunk quota is exceeded; the response lists any evicted filenames.
+List current thread attachments with `GET /files/thread`. The Tkinter
+UI's drag-and-drop chips map to this endpoint — files are persisted,
+not transient.
+
+**Script execution.** `POST /run` accepts a `.py` file upload and
+executes it via subprocess (30s default, override up to 120s via
+`?timeout_seconds=N`). Returns JSON with `exit_code`, `stdout`, `stderr`,
+`timed_out`, `duration_seconds`, and `truncated_*` flags. Output capped
+at 16 KiB per stream. Working directory is a fresh tempdir.
