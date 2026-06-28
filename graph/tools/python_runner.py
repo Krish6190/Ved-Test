@@ -1,115 +1,136 @@
-# tools/python_runner.py
+"""Sandboxed Python execution tool for Ved.
+
+LangChain `@tool`-formatted. The agent binds this via `llm.bind_tools([...])`
+and emits a structured `execute_python(code=...)` call when it wants to run
+code. State (currently unused but kept for consistency / future hardening)
+is injected via `InjectedState`.
+
+The tool:
+  1. Shows a tkinter approval popup showing the code (user must OK).
+  2. Writes the code to a temp file in the OS temp dir.
+  3. Runs it in a subprocess with the current Python interpreter.
+  4. Captures stdout+stderr with a 10-second hard timeout.
+  5. Cleans up the temp file.
+
+The `code` argument is OPTIONAL. If omitted, the tool scans the last AI
+message for a ```python ... ``` fence and uses that body. This makes it
+trivial for the agent to execute code it just emitted without re-typing it.
+
+The user must explicitly approve every execution — this is destructive and
+untrusted by definition.
+"""
 import os
-import sys
-import re
 import subprocess
+import sys
 import tkinter as tk
+from pathlib import Path
 from tkinter import messagebox
-from langchain_core.messages import HumanMessage, AIMessage
+from typing import Annotated
 
-def execute_safe_python_block(state, config) -> dict:
-    """
-    Isolates generated Python code blocks, prompts the user for absolute 
-    permission via a native popup window, and safely compiles the output.
-    """
-    # 1. Locate the most recent assistant or user message turn
-    last_msg_text = ""
-    for msg in reversed(state.messages):
-        if hasattr(msg, "content") and msg.content:
-            last_msg_text = msg.content
-            break
-            
-    # 2. Extract markdown code snippets securely via regex boundaries
-    code_match = re.search(r"```python\s*([\s\S]*?)```", last_msg_text)
-    if not code_match:
-        code_match = re.search(r"```\s*([\s\S]*?)```", last_msg_text)
-        
-    if code_match:
-        raw_code = code_match.group(1).strip()
-    else:
-        raw_code = last_msg_text.strip()
+from langchain_core.tools import tool
+from langgraph.prebuilt import InjectedState
 
-    # Safety boundary check: Guard against system logs, placeholders, or tiny snippets
-    if not raw_code or raw_code.startswith("[System") or len(raw_code.split()) < 2:
-        feedback = HumanMessage(content="SYSTEM NOTICE:\nNo clear executable code block was isolated. Terminal execution aborted.")
-        return {"messages": [feedback], "route_intent": "", "mode": state.mode}
+from graph.state import VedState
+from graph.tools._common import resolve_implicit_python_code
 
-    # 3. INTERLOCK PERMISSION POPUP: Render safely on top of all windows
+_TEMP_DIR = os.environ.get("TEMP") or os.environ.get("TMP") or "C:\\Temp"
+_TIMEOUT_SECONDS = 10
+
+
+def _request_approval(code: str) -> bool:
+    """Show tkinter popup. Returns True only if user explicitly clicks Yes."""
     try:
         root = tk.Tk()
-        root.withdraw()  # Hide the main blank window frame
-        root.attributes("-topmost", True)  # Force popup to the front
-        
-        user_choice = messagebox.askyesno(
-            title="⚠️ Code Execution Approval Requested",
+        root.withdraw()
+        root.attributes("-topmost", True)
+        choice = messagebox.askyesno(
+            title="Ved Code Execution Approval",
             message=(
-                f"Ved is requesting permission to run this generated Python code:\n\n"
-                f"----------------------------------------\n"
-                f"{raw_code[:600]}\n"
-                f"{'... [Truncated for visibility]' if len(raw_code) > 600 else ''}\n"
-                f"----------------------------------------\n\n"
-                f"Do you authorize running this script on your machine?"
+                "Ved is requesting permission to run this generated Python code:\n\n"
+                "----------------------------------------\n"
+                f"{code[:600]}"
+                f"{'...[Truncated]' if len(code) > 600 else ''}\n"
+                "----------------------------------------\n\n"
+                "Authorize running this script on your machine?"
             ),
-            parent=root
+            parent=root,
         )
         root.destroy()
+        return choice
     except Exception:
-        user_choice = False  # Secure fallback: deny if UI initialization fails
+        return False  # secure fallback: deny on UI failure
 
-    if not user_choice:
-        feedback = HumanMessage(content="SYSTEM TOOL BLOCK NOTICE:\nThe user explicitly denied execution authorization for this code block. Explain this restriction calmly.")
-        return {"messages": [feedback], "route_intent": "", "mode": state.mode}
 
-    # 4. Push live status update text to the UI thread streaming queue
-    try:
-        token_queue = config["configurable"]["token_queue"]
-    except (KeyError, TypeError):
-        token_queue = None
-    
-    if token_queue:
-        token_queue.put(f"\n[System Status: Running script execution block...]\n")
+@tool
+def execute_python(
+    code: str = "",
+    state: Annotated[VedState, InjectedState] = None,  # type: ignore[assignment]
+) -> str:
+    """Execute a block of Python code in a sandboxed subprocess.
 
-    # Establish sandboxed temporary runtime file paths
-    temp_script_path = os.path.join(os.environ.get("TEMP", "C:\\Temp"), "ved_runtime_exec.py")
-    os.makedirs(os.path.dirname(temp_script_path), exist_ok=True)
-    
+    The code is written to a temp file and run with the current Python
+    interpreter. Stdout and stderr are captured and returned. A 10-second
+    hard timeout prevents runaway scripts. A tkinter popup asks the user
+    to approve execution every time.
+
+    Args:
+        code: A string containing the Python code to execute. If empty,
+              the tool extracts the most recent ```python ... ``` fence
+              from the last AI message.
+
+    Returns:
+        The combined stdout+stderr output as a string, or `ERROR: ...` if
+        the code was empty, the user denied approval, or execution failed.
+    """
+    raw_code = (code or "").strip()
+
+    # Fallback: if LLM omitted `code`, pull the most recent python fence from the AI message.
+    if not raw_code:
+        raw_code = (resolve_implicit_python_code(state) or "").strip()
+
+    # Skip empty / system placeholders / trivially short snippets
+    if (
+        not raw_code
+        or raw_code.startswith("[System")
+        or len(raw_code.split()) < 2
+    ):
+        return (
+            "ERROR: No clear executable code block was isolated. "
+            "Pass `code` explicitly or include a ```python ... ``` fence "
+            "in the last AI message."
+        )
+
+    if not _request_approval(raw_code):
+        return "ERROR: User denied execution authorization."
+
+    os.makedirs(_TEMP_DIR, exist_ok=True)
+    temp_script = os.path.join(_TEMP_DIR, "ved_runtime_exec.py")
+
     terminal_output = ""
     try:
-        with open(temp_script_path, "w", encoding="utf-8") as f:
-            f.write(raw_code)
-            
-        # Execute the temporary script using the current python environment
-        res = subprocess.run(
-            [sys.executable, "-u", temp_script_path],
+        Path(temp_script).write_text(raw_code, encoding="utf-8")
+        result = subprocess.run(
+            [sys.executable, "-u", temp_script],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
-            timeout=10  # Hardware watchdog limit to prevent lockups
+            timeout=_TIMEOUT_SECONDS,
         )
-        terminal_output = res.stdout
+        terminal_output = result.stdout
     except subprocess.TimeoutExpired:
-        terminal_output = "Execution Failure Error: Terminal process terminated due to a strict hardware timeout gate (10s limit exceeded)."
-    except Exception as e:
-        terminal_output = f"Execution Failure Error: {str(e)}"
+        terminal_output = (
+            f"ERROR: Terminal process terminated - hardware timeout gate "
+            f"({_TIMEOUT_SECONDS}s) exceeded."
+        )
+    except Exception as exc:
+        terminal_output = f"ERROR: {exc}"
     finally:
-        if os.path.exists(temp_script_path):
-            try:
-                os.remove(temp_script_path)
-            except Exception:
-                pass
+        try:
+            if os.path.exists(temp_script):
+                os.remove(temp_script)
+        except Exception:
+            pass
 
     if not terminal_output.strip():
-        terminal_output = "Process execution completed successfully but returned an empty response layout from standard output."
-
-    if token_queue:
-        token_queue.put(f"[System Execution Complete: Received data bytes from subprocess.]\n")
-
-    feedback_message = HumanMessage(
-        content=(
-            "SYSTEM FILE SYSTEM TOOL CALL NOTICE:\n"
-            "The script execution returned the logs below. Analyze these logs and provide a brief summary of the execution results to the user.\n\n"
-            f"TERMINAL RAW LOG OUTPUT:\n{terminal_output.strip()}"
-        )
-    )
-    
-    return {"messages": [feedback_message], "route_intent": "", "mode": state.mode}
+        return "OK: Process completed successfully but produced no stdout output."
+    return f"OK:\n{terminal_output.strip()}"

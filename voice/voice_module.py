@@ -33,7 +33,11 @@ class VoiceSystem:
         json_path = os.path.join(base_dir, os.getenv("voice_json"))
         
         self.piper_model = PiperVoice.load(onnx_path, json_path)
-        self.oww_model = OWWModel(wakeword_models=[self.wake_phrase], vad_threshold=0.25)
+        self.oww_model = OWWModel(
+            wakeword_models=[self.wake_phrase],
+            vad_threshold=0.25,
+            inference_framework="onnx",
+        )
         self.model = WhisperModel("tiny", device="cpu", compute_type="int8", cpu_threads=4)
         
         # UI Button Setup

@@ -42,3 +42,4 @@ class VedState(BaseModel):
     # and the results fetched in response. Path A reads/writes these too via chat_node.
     web_search_needed: bool = Field(default=False)
     web_search_results: list = Field(default_factory=list)
+    self_healing: bool = Field(default=False)

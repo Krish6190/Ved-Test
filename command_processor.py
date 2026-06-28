@@ -224,7 +224,7 @@ class ChatbotCommandProcessor:
 
         # /upload-global — add a file to the private global store (no thread scope).
         # Only reachable via the input bar, so only the local user can populate it.
-        if cmd == "/upload-global":
+        if lower == "/upload-global":
             from tkinter import filedialog
             supported = [(
                 "Parsable Assets",

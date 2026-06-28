@@ -20,6 +20,13 @@
    faster-whisper>=1.0.0
    openwakeword>=0.6.0
    piper-tts>=1.2.0
+   # openwakeword needs a TFLite runtime. The standalone tflite-runtime package
+   # only ships wheels for Python <=3.11, and openwakeword's import error
+   # misleadingly tells users to install it even when tensorflow is present.
+   # tensorflow (>=2.16 on Windows) ships tf.lite.Interpreter, which
+   # openwakeword detects automatically. Use tensorflow as the universal
+   # TFLite runtime so the project works on 3.11, 3.12, and beyond.
+   tensorflow>=2.16.0
 
    # ==============================================================================
    # 3. NEW ASYNCHRONOUS BACKEND AND CORE NETWORK INTEGRATIONS
