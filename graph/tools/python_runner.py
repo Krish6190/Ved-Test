@@ -38,7 +38,46 @@ _TIMEOUT_SECONDS = 10
 
 
 def _request_approval(code: str) -> bool:
-    """Show tkinter popup. Returns True only if user explicitly clicks Yes."""
+    """Request approval before running user-authored Python code.
+
+    Routing:
+      1. If we're inside an active chat session wired to the FastAPI SSE
+         bus (config injected via LangChain's `RunnableConfig`), emit an
+         `approval_request` event with the code preview and block on the
+         existing `_human_approval_event`. The UI modal /chat/approval
+         unblocks us.
+      2. Otherwise, fall back to a tkinter popup (desktop UI only).
+
+    Returns True only if the human explicitly approves.
+    """
+    # ---- SSE / FastAPI path ----
+    try:
+        from langchain_core.runnables import RunnableConfig  # noqa: F401
+        # The graph node passes RunnableConfig to tool calls when bound via
+        # `llm.bind_tools(VED_TOOLS)`. We can't access the call's config from
+        # here directly (LangChain strips it from the tool args before invoking),
+        # so we rely on a thread-local set by the node.
+        from graph.tools._common import get_current_runtime_config
+        cfg = get_current_runtime_config() or {}
+        conf = cfg.get("configurable", {}) or {}
+        token_queue = conf.get("token_queue")
+        approval_event = conf.get("approval_event")
+        approval_state = conf.get("approval_state")
+        if token_queue is not None and approval_event is not None and approval_state is not None:
+            try:
+                token_queue.put(("approval_request", {
+                    "kind": "python_execution",
+                    "code": code[:600] + ("...[Truncated]" if len(code) > 600 else ""),
+                    "code_length": len(code),
+                }))
+            except Exception:
+                return False
+            approval_event.wait()
+            return bool((approval_state or {}).get("value"))
+    except Exception:
+        pass
+
+    # ---- Tk popup fallback (desktop UI) ----
     try:
         root = tk.Tk()
         root.withdraw()
@@ -59,7 +98,6 @@ def _request_approval(code: str) -> bool:
         return choice
     except Exception:
         return False  # secure fallback: deny on UI failure
-
 
 @tool
 def execute_python(
@@ -83,12 +121,8 @@ def execute_python(
         the code was empty, the user denied approval, or execution failed.
     """
     raw_code = (code or "").strip()
-
-    # Fallback: if LLM omitted `code`, pull the most recent python fence from the AI message.
     if not raw_code:
         raw_code = (resolve_implicit_python_code(state) or "").strip()
-
-    # Skip empty / system placeholders / trivially short snippets
     if (
         not raw_code
         or raw_code.startswith("[System")

@@ -1,7 +1,8 @@
 """Singleton lifecycle for the FastAPI server.
 
 Holds the single Chatbot instance (lazy) and the registry of in-flight
-approval sessions used by /chat (SSE) and /chat/approval.
+approval sessions used by /chat (SSE) and /chat/approval, plus the
+registry for tool-creation proposals used by /chat/tool-creation/approval.
 """
 from __future__ import annotations
 
@@ -17,6 +18,12 @@ _chatbot_lock = threading.Lock()
 # route sets the event to unblock the generator.
 _pending_approvals: Dict[str, threading.Event] = {}
 _pending_lock = threading.Lock()
+
+# Per-session tool-creation proposal events. SSE handlers register an
+# event here when the graph emits a tool_creation_proposal; the
+# /chat/tool-creation/approval route sets the event to unblock propose_tool.
+_pending_tool_proposals: Dict[str, threading.Event] = {}
+_pending_tool_lock = threading.Lock()
 
 
 def get_chatbot():
@@ -78,6 +85,45 @@ def discard_approval(session_id: str) -> None:
         _pending_approvals.pop(session_id, None)
 
 
+# ---- Tool-creation proposal registry ----
+
+def register_tool_proposal(session_id: str) -> threading.Event:
+    """Register a tool-creation proposal session. Returns the Event."""
+    event = threading.Event()
+    with _pending_tool_lock:
+        _pending_tool_proposals[session_id] = event
+    return event
+
+
+def resolve_tool_proposal(session_id: str, approved: bool) -> bool:
+    """Resolve a pending tool-creation proposal.
+
+    Sets the event so the propose_tool generator resumes, and updates the
+    chatbot's _tool_creation_state. Returns True if a matching session
+    was found.
+    """
+    with _pending_tool_lock:
+        event = _pending_tool_proposals.pop(session_id, None)
+    if event is None:
+        return False
+    try:
+        bot = get_chatbot()
+        if hasattr(bot, "_tool_creation_state"):
+            bot._tool_creation_state["value"] = bool(approved)
+            bot._tool_creation_state["session_id"] = session_id
+        bot.submit_tool_creation_approval(session_id, approved)
+    except Exception:
+        pass
+    event.set()
+    return True
+
+
+def discard_tool_proposal(session_id: str) -> None:
+    """Remove a tool-proposal session without resolving it."""
+    with _pending_tool_lock:
+        _pending_tool_proposals.pop(session_id, None)
+
+
 def reset_for_tests() -> None:
     """Reset module state. Only for use in tests."""
     global _chatbot
@@ -85,3 +131,5 @@ def reset_for_tests() -> None:
         _chatbot = None
     with _pending_lock:
         _pending_approvals.clear()
+    with _pending_tool_lock:
+        _pending_tool_proposals.clear()

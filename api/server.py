@@ -40,6 +40,7 @@ from api.schemas import (
     ModeOut,
     RenameThreadReq,
     RunOut,
+    ToolCreationApprovalReq,
     SetModeReq,
     ThreadFileOut,
     ThreadOut,
@@ -242,6 +243,7 @@ async def chat(req: ChatReq) -> StreamingResponse:
         threading.Thread(target=pump, daemon=True).start()
 
         approval_registered = False
+        tool_proposal_registered = False
         try:
             while True:
                 item = await bridge.get()
@@ -267,11 +269,39 @@ async def chat(req: ChatReq) -> StreamingResponse:
                         "approval_request",
                         {"pass": pass_num, "session_id": session_id},
                     ).encode("utf-8")
+                elif event_type == "tool_creation_proposal":
+                    if not tool_proposal_registered:
+                        lifecycle.register_tool_proposal(session_id)
+                        # Also stamp the chatbot's session_id so propose_tool's
+                        # wait loop can be resolved by the right caller.
+                        try:
+                            if hasattr(bot, "_tool_creation_state"):
+                                bot._tool_creation_state["session_id"] = session_id
+                        except Exception:
+                            pass
+                        tool_proposal_registered = True
+                    yield _sse(
+                        "tool_creation_proposal",
+                        {"session_id": session_id, **(payload or {})},
+                    ).encode("utf-8")
+                elif event_type == "tool_call":
+                    yield _sse(
+                        "tool_call",
+                        {"session_id": session_id, **(payload or {})},
+                    ).encode("utf-8")
+                elif event_type == "mode_switch":
+                    # Informational — no approval gate.
+                    yield _sse(
+                        "mode_switch",
+                        {"session_id": session_id, **(payload or {})},
+                    ).encode("utf-8")
                 elif event_type == "error":
                     yield _sse("error", {"message": str(payload), "session_id": session_id}).encode("utf-8")
         finally:
             if approval_registered:
                 lifecycle.discard_approval(session_id)
+            if tool_proposal_registered:
+                lifecycle.discard_tool_proposal(session_id)
             yield _sse("done", {"session_id": session_id}).encode("utf-8")
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
@@ -286,6 +316,24 @@ async def submit_approval(req: ApprovalReq) -> dict:
         raise HTTPException(
             status_code=404,
             detail=f"No pending approval for session: {req.session_id}",
+        )
+    return {"resolved": True, "session_id": req.session_id, "approved": req.approved}
+
+
+@app.post("/chat/tool-creation/approval")
+async def submit_tool_creation_approval(req: ToolCreationApprovalReq) -> dict:
+    """Resolve a pending tool-creation proposal emitted by `propose_tool`.
+
+    The chat SSE handler dispatches `event: tool_creation_proposal` with
+    `session_id` + the proposed code; the UI shows a modal and POSTs here
+    with the human's decision. On approval, `propose_tool` writes the file,
+    imports the new module, and registers the new tool in VED_TOOLS.
+    """
+    found = lifecycle.resolve_tool_proposal(req.session_id, req.approved)
+    if not found:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No pending tool-creation proposal for session: {req.session_id}",
         )
     return {"resolved": True, "session_id": req.session_id, "approved": req.approved}
 
@@ -373,9 +421,6 @@ async def upload_global_file(file: UploadFile = File(...)) -> GlobalFileOut:
             os.unlink(tmp_path)
         except Exception:
             pass
-    # Use the user's upload filename for the response — consistent with
-    # the /files/thread route. The store may derive its own internal label
-    # from the temp path; the UI displays the original filename.
     return GlobalFileOut(
         filename=file.filename or meta.get("filename", "unknown"),
         chunk_count=int(meta.get("chunk_count", 0)),
@@ -428,11 +473,6 @@ async def upload_thread_file(file: UploadFile = File(...)) -> ThreadFileOut:
                 f.write(chunk)
         if not hasattr(bot, "_thread_files") or bot._thread_files is None:
             raise HTTPException(status_code=500, detail="Thread file store not initialized.")
-        # Pass the upload's original filename to the store when supported.
-        # The real ThreadFileStore.add(thread_id, source_path) does not
-        # accept a filename kwarg; the TypeError branch keeps the real bot
-        # working while the fake (which does accept it) records the user's
-        # upload name so list_thread_files returns it correctly.
         try:
             entry = bot._thread_files.add(thread_id, tmp_path, filename=file.filename or "")
         except TypeError:
@@ -446,9 +486,6 @@ async def upload_thread_file(file: UploadFile = File(...)) -> ThreadFileOut:
             os.unlink(tmp_path)
         except Exception:
             pass
-    # Use the user's upload filename for the response — the store derives
-    # its own internal source label from the temp path, but the UI displays
-    # the original filename the user uploaded.
     return ThreadFileOut(
         filename=file.filename or entry.get("filename", "unknown"),
         chunk_count=int(entry.get("chunk_count", 0)),

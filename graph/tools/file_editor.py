@@ -29,7 +29,6 @@ from graph.tools._common import (
     resolve_implicit_target,
 )
 
-
 def _request_approval(path: Path, old: str, new: str, self_healing: bool, overwrite: bool) -> bool:
     try:
         root = tk.Tk()

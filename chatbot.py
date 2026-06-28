@@ -285,6 +285,28 @@ class Chatbot(ChatbotCommandProcessor):
                 try: requests.post(f"{base_url}/api/generate", json={"model": active_adapter.model_name, "prompt": "", "keep_alive": "20m"}, timeout=15)
                 except Exception: pass
 
+    def _rebuild_graph(self) -> None:
+        """Rebuild the graph for the current mode. Called by nodes after a
+        cross-mode tool-creation trigger so the next LLM invocation uses
+        the newly-loaded model's bound tools."""
+        if self.mode == "hibernate":
+            return
+        from graph import build_graph
+        self._graph = build_graph(self._get_llm)
+
+    def submit_tool_creation_approval(self, session_id: str, approved: bool) -> bool:
+        """Resolve a pending tool-creation proposal. Returns True if a
+        matching session was found, False otherwise."""
+        state = getattr(self, "_tool_creation_state", None)
+        event = getattr(self, "_tool_creation_event", None)
+        if state is None or event is None:
+            return False
+        if state.get("session_id") != session_id:
+            return False
+        state["value"] = bool(approved)
+        event.set()
+        return True
+
     def respond(self, message: str):
         cmd_resp = self.handle_command(message)
         if cmd_resp is not None:
@@ -324,7 +346,9 @@ class Chatbot(ChatbotCommandProcessor):
             token_queue = queue.Queue()
             self._human_approval_event = threading.Event()
             self._human_approval_state = {"value": None}
-            config = {"configurable": {"system_prompt": adapter.system_prompt + HALLUCINATION_GUARD, "token_queue": token_queue, "approval_event": self._human_approval_event, "approval_state": self._human_approval_state, "tool_approved": True, "active_thread_id": self._active_thread_id}}
+            self._tool_creation_event = threading.Event()
+            self._tool_creation_state = {"value": None, "session_id": None}
+            config = {"configurable": {"system_prompt": adapter.system_prompt + HALLUCINATION_GUARD, "token_queue": token_queue, "approval_event": self._human_approval_event, "approval_state": self._human_approval_state, "tool_creation_event": self._tool_creation_event, "tool_creation_state": self._tool_creation_state, "tool_approved": True, "active_thread_id": self._active_thread_id, "session_id": "", "set_mode": self.set_mode, "rebuild_graph": self._rebuild_graph}}
             last_node_seen = "Unknown"
             accumulated_state = dict(input_state)
             def run_graph():

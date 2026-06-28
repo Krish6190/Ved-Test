@@ -10,11 +10,14 @@ Tool list, with one-line summaries:
   - overwrite_file — replace a file's full contents (approval popup)
   - search_files   — recursive glob search for files
   - execute_python — run a Python code block in a subprocess (approval popup, 10s timeout)
+  - propose_tool   — design a new tool at runtime, ask human, save + register (approval modal)
 """
 from graph.tools.file_reader import read_file
 from graph.tools.file_editor import edit_file, overwrite_file
 from graph.tools.file_search import search_files
 from graph.tools.python_runner import execute_python
+from graph.tools.tool_creator import propose_tool
+from graph.tools.app_launcher import open_app
 
 VED_TOOLS = [
     read_file,
@@ -22,6 +25,12 @@ VED_TOOLS = [
     overwrite_file,
     search_files,
     execute_python,
+    propose_tool,
+    open_app,
 ]
+from graph.tools import user_tools 
 
-__all__ = ["VED_TOOLS", "read_file", "edit_file", "overwrite_file", "search_files", "execute_python"]
+__all__ = [
+    "VED_TOOLS", "read_file", "edit_file", "overwrite_file",
+    "search_files", "execute_python", "propose_tool", "open_app",
+]

@@ -89,6 +89,18 @@
         "additional_kwargs": {
           "pinned": true
         }
+      },
+      {
+        "role": "human",
+        "content": "hlo ved"
+      },
+      {
+        "role": "human",
+        "content": "hlo ved"
+      },
+      {
+        "role": "ai",
+        "content": "```\n{\"name\": \"read_file\", \"parameters\": {\"path\": \" Ved — Local Multi-Format Offline AI Agent\"}} \n{\"name\": \"read_file\", \"parameters\": {\"path\": \" Ved — Local Multi-Format Offline AI Agent\"}} \n{\"name\": \"search_files\", \"parameters\": {\"pattern\": \"\", \"directory\": \".\"}} \n{\"name\": \"execute_python\", \"parameters\": {\"code\": \"\"}} \n{\"name\": \"open_app\", \"query\": \"discord\"} \n{\"name\": \"read_file\", \"parameters\": {\"path\": \" Ved — Local Multi-Format Offline AI Agent\"}} \n{\"name\": \"search_files\", \"parameters\": {\"pattern\": \"\", \"directory\": \".\"}} \n{\"name\": \"execute_python\", \"parameters\": {\"code\": \"\"}}\n```"
       }
     ]
   },

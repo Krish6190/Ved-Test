@@ -1,8 +1,6 @@
 """Pydantic request/response schemas for the Ved HTTP API."""
 from __future__ import annotations
-
 from typing import List, Optional
-
 from pydantic import BaseModel, Field
 
 
@@ -46,6 +44,11 @@ class ChatReq(BaseModel):
 
 
 class ApprovalReq(BaseModel):
+    approved: bool
+    session_id: str
+
+
+class ToolCreationApprovalReq(BaseModel):
     approved: bool
     session_id: str
 
