@@ -18,6 +18,7 @@ from graph.tools.file_search import search_files
 from graph.tools.python_runner import execute_python
 from graph.tools.tool_creator import propose_tool
 from graph.tools.app_launcher import open_app
+from graph.tools.rag_retrieve import retrieve_rag
 
 VED_TOOLS = [
     read_file,
@@ -27,10 +28,24 @@ VED_TOOLS = [
     execute_python,
     propose_tool,
     open_app,
+    retrieve_rag,
+]
+
+# Tools available to Path A's executor (standard/turbo mode). Excludes the
+# coding-only tools (edit_file, overwrite_file, execute_python,
+# propose_tool) so llama can't accidentally write code or run scripts.
+# In coder mode the executor gets full VED_TOOLS instead.
+PATH_A_EXECUTOR_TOOLS = [
+    read_file,
+    search_files,
+    retrieve_rag,
+    open_app,
 ]
 from graph.tools import user_tools 
 
 __all__ = [
-    "VED_TOOLS", "read_file", "edit_file", "overwrite_file",
+    "VED_TOOLS", "PATH_A_EXECUTOR_TOOLS",
+    "read_file", "edit_file", "overwrite_file",
     "search_files", "execute_python", "propose_tool", "open_app",
+    "retrieve_rag",
 ]

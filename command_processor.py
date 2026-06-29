@@ -52,62 +52,50 @@ class ChatbotCommandProcessor:
         return self._handle_thread_commands(message)
 
     def _handle_memory_commands(self, cmd: str) -> str | None:
+        # All pin/unpin/list commands operate on the CURRENT thread's
+        # messages. Pinned messages stay where they are (no cross-thread
+        # injection) and are marked with additional_kwargs["pinned"]=True.
+        # The state.limit_messages reducer preserves them during trimming.
+
         if cmd == "/pin":
-            user_msgs = [m for m in self._conversation_history if isinstance(m, HumanMessage)]
-            ai_msgs = [m for m in self._conversation_history if isinstance(m, AIMessage)]
-            if not user_msgs or not ai_msgs:
+            current_pinned = len(self.get_pinned_messages_in_active_thread())
+            # Per-thread limit of 20 pins (was a global limit before).
+            if current_pinned >= 20:
+                return "Pin rejected: this thread already has 20 pinned messages."
+            # Don't pin duplicates (same last turn already pinned).
+            thread = self.get_active_thread()
+            msgs = thread.get("messages", [])
+            if msgs and getattr(msgs[-1], "additional_kwargs", {}).get("pinned", False):
+                return "Last turn is already pinned."
+            pinned_count = self.pin_last_turn_in_active_thread()
+            if pinned_count == 0:
                 return "Error: No conversation exchange found to pin."
-            saved = self._load_pinned_contents()
-            if len(saved) >= 20:
-                return "Pin rejected: Pinned limits cannot exceed half of total VRAM context slots (Max 20)."
-            last_user_text, last_ai_text = user_msgs[-1].content, ai_msgs[-1].content
-            if any(isinstance(item, dict) and item.get("user") == last_user_text for item in saved):
-                return "Message turn is already pinned."
-            saved.append({"user": last_user_text, "assistant": last_ai_text})
-            self._save_pinned_contents(saved)
-            for m in reversed(self._conversation_history):
-                if m.content in [last_user_text, last_ai_text]:
-                    m.additional_kwargs["pinned"] = True
-            self._save_threads()
-            return f"Success: Pinned turn sequence. ({len(saved)}/20 occupied)"
+            return f"Success: Pinned {pinned_count} message(s). ({current_pinned + pinned_count}/20 in this thread)"
 
         if cmd == "/unpin_all":
-            self._save_pinned_contents([])
-            for m in self._conversation_history:
-                if "pinned" in m.additional_kwargs:
-                    m.additional_kwargs["pinned"] = False
-            self._save_threads()
-            return "Cleared all long-term memory pins."
+            cleared = self.unpin_all_in_active_thread()
+            return f"Cleared all pins in this thread ({cleared} message(s))."
 
         if cmd.startswith("/unpin "):
             try:
-                idx = int(cmd.split()[1]) - 1
-                saved = self._load_pinned_contents()
-                if idx < 0 or idx >= len(saved):
-                    return f"Index error. Range 1 to {len(saved)}."
-                removed_pair = saved.pop(idx)
-                self._save_pinned_contents(saved)
-                if isinstance(removed_pair, dict):
-                    rem_user, rem_ai = removed_pair.get("user", ""), removed_pair.get("assistant", "")
-                    for m in self._conversation_history:
-                        if m.content in [rem_user, rem_ai]:
-                            m.additional_kwargs["pinned"] = False
-                self._save_threads()
-                return f"Unpinned memory element {idx + 1}."
+                idx = int(cmd.split()[1])
             except (ValueError, IndexError):
                 return "Usage error. Format: /unpin <integer_index>"
+            removed = self.unpin_in_active_thread(idx)
+            if removed == 0:
+                return f"Index error. No pinned message at position {idx}."
+            return f"Unpinned message {idx}."
 
         if cmd in ("/list", "/memories"):
-            saved = self._load_pinned_contents()
-            if not saved:
-                return "Long term context storage is empty."
-            lines = [
-                f"{i+1}. {item.get('user', '')[:60]}..."
-                if isinstance(item, dict)
-                else f"{i+1}. {str(item)[:60]}..."
-                for i, item in enumerate(saved)
-            ]
-            return "Pinned Memories (Prompts):\n" + "\n".join(lines)
+            pinned = self.get_pinned_messages_in_active_thread()
+            if not pinned:
+                return "No pinned messages in this thread."
+            lines = []
+            for i, m in enumerate(pinned, start=1):
+                role = type(m).__name__.replace("Message", "").upper()
+                content = m.content if isinstance(m.content, str) else str(m.content)
+                lines.append(f"{i}. [{role}] {content[:100]}{'...' if len(content) > 100 else ''}")
+            return f"Pinned Messages in This Thread ({len(pinned)}/20):\n" + "\n".join(lines)
 
         if cmd == "/run":
             # Open file dialog → confirm → execute script via subprocess.

@@ -213,6 +213,31 @@ async def chat(req: ChatReq) -> StreamingResponse:
     bot = lifecycle.get_chatbot()
     session_id = uuid.uuid4().hex
 
+    # Large-paste handling (mirrors the Tkinter UI's behavior in
+    # gui_rag_worker._ingest_payload): if the user pastes a big block,
+    # save the full text into the thread's RAG store and replace the
+    # prompt with a short reference + a tail excerpt. The LLM can call
+    # retrieve_rag if it needs the full version.
+    LARGE_PASTE_THRESHOLD = 1700
+    if len(req.prompt) > LARGE_PASTE_THRESHOLD:
+        try:
+            import time as _t, secrets as _s
+            source_label = f"UserPaste_{int(_t.time())}_{_s.token_hex(3)}"
+            bot.save_user_input_to_thread_rag(req.prompt, source_label)
+            tail = req.prompt[-200:].replace("\n", " ")
+            req = ChatReq(
+                prompt=(
+                    f"[The user pasted {len(req.prompt)} characters. "
+                    f"Full text saved to thread RAG under '{source_label}'. "
+                    "Use retrieve_rag if you need the full version.]\n\n"
+                    f"...(tail of paste): ...{tail}"
+                ),
+                attachments=req.attachments,
+            )
+        except Exception:
+            # If RAG save fails, fall through with the original prompt.
+            pass
+
     async def event_stream() -> AsyncIterator[bytes]:
         try:
             response = bot.respond(req.prompt)

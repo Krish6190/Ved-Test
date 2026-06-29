@@ -17,6 +17,7 @@ You have access to these tools. CALL THEM when the task requires file I/O, searc
   - overwrite_file(path, content) Replace a file's entire contents.
   - execute_python(code)       Run a Python code block in a sandboxed subprocess (10s timeout).
   - open_app(query)            Launch any application by name (e.g. "discord", "steam", "firefox"). Searches Start Menu, install dirs, and PATH. Always requires human approval.
+  - retrieve_rag(query, k=5)   Pull full content from the thread's RAG store on demand. Use this when a previous response was compressed and the user asks for the full version, or when you need context from earlier in the conversation that's no longer visible.
   - propose_tool(name, desc, code) Design a new persistent tool (only when the user explicitly wants a reusable tool).
 
 # WORKFLOW

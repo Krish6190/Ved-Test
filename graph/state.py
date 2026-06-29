@@ -1,4 +1,4 @@
-from typing import TypedDict, Annotated, Sequence, Literal
+from typing import TypedDict, Annotated, Optional, Sequence, Literal
 from langgraph.graph.message import add_messages
 from langchain_core.messages import BaseMessage, SystemMessage
 from pydantic import BaseModel, Field
@@ -43,3 +43,9 @@ class VedState(BaseModel):
     web_search_needed: bool = Field(default=False)
     web_search_results: list = Field(default_factory=list)
     self_healing: bool = Field(default=False)
+    # Planner-executor pipeline state. Set by planner_node, read by
+    # executor_node. Cleared when the plan finalizes or the planner
+    # emits DIRECT_ANSWER.
+    active_plan_id: Optional[str] = Field(default=None)
+    current_chunk_id: Optional[int] = Field(default=None)
+    final_summary: Optional[str] = Field(default=None)

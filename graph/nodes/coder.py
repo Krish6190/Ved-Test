@@ -40,13 +40,9 @@ def coder_chat_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
     if hasattr(llm, "temperature"):
         llm.temperature = 0.1
     user_messages = [msg for msg in state.messages if isinstance(msg, HumanMessage)]
-    last_user_text = user_messages[-1].content.strip().lower() if user_messages else ""
-    if last_user_text.startswith("/run") or "execute script" in last_user_text:
-        return {
-            "messages": state.messages,
-            "route_intent": "C",
-            "mode": state.mode
-        }
+    # Path C (legacy /run -> python_tool_node) has been removed. /run and
+    # "execute script" now flow through the regular coder flow; the LLM
+    # calls execute_python via its bound tools.
     llm_with_tools = llm.bind_tools(VED_TOOLS)
     try:
         token_queue = config["configurable"]["token_queue"]

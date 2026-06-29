@@ -5,7 +5,7 @@ import time
 from pathlib import Path
 import requests
 from __init__ import DEFAULT_MODE, MODES
-from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, BaseMessage
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, ToolMessage, BaseMessage
 from graph import build_graph
 from model_adapter import ModelAdapter, parse_modelfile
 from command_processor import ChatbotCommandProcessor
@@ -35,6 +35,65 @@ def _trim_thread_messages(messages: list) -> list:
         return [system] + others[-(THREAD_MESSAGE_CAP - 1):]
     return others[-THREAD_MESSAGE_CAP:]
 
+def _save_ai_response_to_thread_rag(thread_id: str, content: str, source_label: str) -> bool:
+    """Inject a long AI response into the thread's RAG store with FIFO eviction.
+
+    Best-effort: if the embedding pipeline or RAG store is unavailable,
+    this returns False silently. The summary remains in history either way,
+    so the conversation history is never blocked on RAG availability.
+
+    Returns True on success, False if RAG was unavailable.
+    """
+    if not content or not thread_id:
+        return False
+    try:
+        # Lazy import to avoid loading the embedding model at import time.
+        from data.thread_files import ThreadFileStore
+        from graph.rag import rag_db as default_rag_db
+        store = ThreadFileStore(default_rag_db)
+        store.add_text(thread_id, content, source_label)
+        return True
+    except Exception as e:
+        # Embedding pipeline may be unavailable (no Ollama, no model loaded).
+        # Log but don't raise — persistence must never break the chat loop.
+        print(f"[RAG Save] Skipped for thread {thread_id[:8]}: {e}", flush=True)
+        return False
+
+
+
+# history. The full text is injected into the thread's RAG store with FIFO
+# eviction; only the head + tail summary stays in the message list. This
+# keeps thread history compact while preserving the full content for RAG
+# retrieval.
+_AI_SUMMARY_THRESHOLD_CHARS = 1200  # ~300 tokens
+_AI_SUMMARY_HEAD_WORDS = 30
+_AI_SUMMARY_TAIL_WORDS = 30
+
+# Tool messages persisted to history get truncated to this many chars.
+# The LLM usually only needs the first chunk to know what the tool returned.
+# Use retrieve_rag to recover the full output if needed.
+_TOOL_HISTORY_TRUNCATE_CHARS = 800  # ~200 tokens
+
+
+def _compress_ai_content(content: str) -> str:
+    """Compress long AI content to head + tail summary for history persistence.
+
+    Short content is returned unchanged. Long content is reduced to the
+    first 30 words, a marker, and the last 30 words. The full content is
+    intended to be saved separately into RAG.
+    """
+    if not content:
+        return content
+    if len(content) <= _AI_SUMMARY_THRESHOLD_CHARS:
+        return content
+    words = content.split()
+    if len(words) <= _AI_SUMMARY_HEAD_WORDS + _AI_SUMMARY_TAIL_WORDS + 4:
+        return content
+    head = " ".join(words[:_AI_SUMMARY_HEAD_WORDS])
+    tail = " ".join(words[-_AI_SUMMARY_TAIL_WORDS:])
+    return f"{head}\n\n... [full response stored in thread RAG; retrieval key: see message metadata] ...\n\n{tail}"
+
+
 def _serialize_message(msg) -> dict:
     cls_name = type(msg).__name__
     if cls_name == "HumanMessage":
@@ -43,25 +102,47 @@ def _serialize_message(msg) -> dict:
         role = "ai"
     elif cls_name == "SystemMessage":
         role = "system"
+    elif cls_name == "ToolMessage":
+        role = "tool"
     else:
         role = cls_name.lower()
-    out = {"role": role, "content": msg.content}
+    content = msg.content
+    # Compact long tool outputs in history. The LLM usually only needs the
+    # first chunk to know what the tool returned; full output can be
+    # recovered later via retrieve_rag if needed.
+    if cls_name == "ToolMessage" and isinstance(content, str) and len(content) > _TOOL_HISTORY_TRUNCATE_CHARS:
+        content = (
+            content[:_TOOL_HISTORY_TRUNCATE_CHARS]
+            + f"\n\n...[truncated; full output recoverable via retrieve_rag]"
+        )
+    out = {"role": role, "content": content}
+    # ToolMessage carries tool_call_id which the LLM uses to associate the
+    # result with the originating tool_call. Preserve it across save/load.
+    tool_call_id = getattr(msg, "tool_call_id", None)
+    if tool_call_id:
+        out["tool_call_id"] = tool_call_id
     # Preserve additional_kwargs (e.g., "pinned": True so FIFO doesn't drop pinned turns).
     extra = getattr(msg, "additional_kwargs", None)
     if extra:
         out["additional_kwargs"] = dict(extra)
     return out
 
+
 def _deserialize_message(data: dict) -> BaseMessage:
     role = data.get("role", "")
     content = data.get("content", "")
     extra = data.get("additional_kwargs") or {}
+    tool_call_id = data.get("tool_call_id")
     if role == "human":
         msg = HumanMessage(content=content)
     elif role == "ai":
         msg = AIMessage(content=content)
     elif role == "system":
         msg = SystemMessage(content=content)
+    elif role == "tool":
+        # ToolMessage requires tool_call_id; use a placeholder if missing.
+        # Older saves (pre-tool-persistence) may not have stored one.
+        msg = ToolMessage(content=content, tool_call_id=tool_call_id or "legacy_unpaired")
     else:
         msg = HumanMessage(content=content)
     if extra:
@@ -150,7 +231,15 @@ class Chatbot(ChatbotCommandProcessor):
         path = self.threads_db_path
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = {}
-        for tid, thread in self._threads.items():
+        # Iterate threads in REVERSE chronological order so the JSON file
+        # has newest threads first. Dict iteration order is preserved in
+        # Python 3.7+, so this puts the most recent thread at the top of
+        # the file for easy human inspection and predictable load order.
+        for tid, thread in sorted(
+            self._threads.items(),
+            key=lambda kv: kv[1].get("created_at", 0.0),
+            reverse=True,
+        ):
             thread["messages"] = _trim_thread_messages(thread["messages"])
             payload[tid] = {
                 "id": thread["id"],
@@ -161,9 +250,11 @@ class Chatbot(ChatbotCommandProcessor):
         path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
     def list_threads(self) -> list:
+        """Return threads sorted newest-first by created_at."""
         return sorted(
             ({"id": t["id"], "title": t["title"], "created_at": t["created_at"]} for t in self._threads.values()),
             key=lambda d: d["created_at"],
+            reverse=True,
         )
 
     def create_thread(self, title: str | None = None) -> str:
@@ -285,6 +376,20 @@ class Chatbot(ChatbotCommandProcessor):
                 try: requests.post(f"{base_url}/api/generate", json={"model": active_adapter.model_name, "prompt": "", "keep_alive": "20m"}, timeout=15)
                 except Exception: pass
 
+    def save_user_input_to_thread_rag(self, prompt: str, source_label: str) -> bool:
+        """Persist a long user paste into the active thread's RAG store.
+
+        Used by the web UI when /chat receives a prompt above the threshold.
+        The full text is chunked + embedded + stored with FIFO eviction;
+        a short reference is sent to the LLM and the full version is
+        recoverable via retrieve_rag(query).
+        """
+        thread = self.get_active_thread()
+        thread_id = thread.get("id") if thread else None
+        if not thread_id:
+            return False
+        return _save_ai_response_to_thread_rag(thread_id, prompt, source_label)
+
     def _rebuild_graph(self) -> None:
         """Rebuild the graph for the current mode. Called by nodes after a
         cross-mode tool-creation trigger so the next LLM invocation uses
@@ -320,17 +425,12 @@ class Chatbot(ChatbotCommandProcessor):
             print("[DEBUG] stream generator started")
             active = self.get_active_thread()
             was_empty = len(active["messages"]) == 0 and active["title"] == "New Thread"
-            pinned_memories = self._load_pinned_contents()
+            # Per-thread pinned messages are already part of `history`
+            # (they live inside the thread with additional_kwargs["pinned"]=True).
+            # No cross-thread injection. The trimming logic in state.py
+            # preserves pinned messages from being dropped.
             history = active["messages"]
-            if not history:
-                initial_messages = [SystemMessage(content=adapter.system_prompt)]
-                for pair in pinned_memories:
-                    if isinstance(pair, dict):
-                        initial_messages.append(HumanMessage(content=pair.get("user", "")))
-                        initial_messages.append(AIMessage(content=pair.get("assistant", "")))
-                initial_messages.append(HumanMessage(content=message))
-            else:
-                initial_messages = list(history) + [HumanMessage(content=message)]
+            initial_messages = list(history) + [HumanMessage(content=message)]
             if was_empty:
                 active["title"] = self._autotitle_from_message(message)
             input_state = {
@@ -388,6 +488,23 @@ class Chatbot(ChatbotCommandProcessor):
                         active["messages"] = list(initial_messages) + new_ai
                     else:
                         active["messages"] = list(final_msgs)
+                # Compress long AI messages: save the full text into the
+                # thread's RAG store with FIFO eviction, then replace the
+                # in-memory content with a head+tail summary. ToolMessage
+                # results are kept verbatim so the LLM can see them on the
+                # next turn.
+                active_thread_id = active.get("id")
+                for msg in list(active["messages"]):
+                    if isinstance(msg, AIMessage):
+                        full_content = msg.content if isinstance(msg.content, str) else str(msg.content)
+                        if len(full_content) > _AI_SUMMARY_THRESHOLD_CHARS and active_thread_id:
+                            # Inject full content into RAG (best-effort).
+                            source_label = f"ai_response_{int(time.time())}_{secrets.token_hex(3)}"
+                            _save_ai_response_to_thread_rag(
+                                active_thread_id, full_content, source_label
+                            )
+                            # Replace content with summary in place.
+                            msg.content = _compress_ai_content(full_content)
                 self._save_threads()
             if "saved_memories" in accumulated_state:
                 self.saved_memories = accumulated_state["saved_memories"]
@@ -419,10 +536,64 @@ class Chatbot(ChatbotCommandProcessor):
     def list_global_files(self) -> list:
         return self._global_files.list_uploads()
 
-    def _get_memory_filepath(self) -> Path: return self.project_root / "data" / "long_term_memory.json"
-    def _load_pinned_contents(self) -> list:
-        path = self._get_memory_filepath()
-        if not path.exists(): return []
-        try: return json.loads(path.read_text(encoding="utf-8"))
-        except Exception: return []
-    def _save_pinned_contents(self, contents: list): self._get_memory_filepath().write_text(json.dumps(contents), encoding="utf-8")
+    # ---- Per-thread pinning (metadata only) ----
+    # Pinned messages are marked with `additional_kwargs["pinned"] = True`.
+    # They live inside their own thread and never leak into other threads.
+    # The state.limit_messages reducer preserves them from being trimmed.
+
+    def get_pinned_messages_in_active_thread(self) -> list:
+        """Return the pinned messages in the current thread, oldest first."""
+        thread = self.get_active_thread()
+        out = []
+        for m in thread.get("messages", []):
+            if getattr(m, "additional_kwargs", {}).get("pinned", False):
+                out.append(m)
+        return out
+
+    def pin_last_turn_in_active_thread(self) -> int:
+        """Mark the last AI message (and its preceding Human) as pinned.
+
+        Returns the number of messages newly pinned. 0 if nothing to pin.
+        """
+        thread = self.get_active_thread()
+        msgs = thread.get("messages", [])
+        # Find the last AIMessage in the thread.
+        last_ai_idx = -1
+        for i in range(len(msgs) - 1, -1, -1):
+            if isinstance(msgs[i], AIMessage):
+                last_ai_idx = i
+                break
+        if last_ai_idx < 0:
+            return 0
+        pinned_count = 0
+        msgs[last_ai_idx].additional_kwargs["pinned"] = True
+        pinned_count += 1
+        # Also pin the immediately preceding HumanMessage if present.
+        if last_ai_idx > 0 and isinstance(msgs[last_ai_idx - 1], HumanMessage):
+            msgs[last_ai_idx - 1].additional_kwargs["pinned"] = True
+            pinned_count += 1
+        self._save_threads()
+        return pinned_count
+
+    def unpin_in_active_thread(self, index_1based: int) -> int:
+        """Unpin the Nth pinned message in the current thread (1-based)."""
+        thread = self.get_active_thread()
+        pinned = self.get_pinned_messages_in_active_thread()
+        if index_1based < 1 or index_1based > len(pinned):
+            return 0
+        target = pinned[index_1based - 1]
+        target.additional_kwargs["pinned"] = False
+        self._save_threads()
+        return 1
+
+    def unpin_all_in_active_thread(self) -> int:
+        """Clear the pinned flag on all messages in the current thread."""
+        thread = self.get_active_thread()
+        cleared = 0
+        for m in thread.get("messages", []):
+            if getattr(m, "additional_kwargs", {}).get("pinned", False):
+                m.additional_kwargs["pinned"] = False
+                cleared += 1
+        if cleared:
+            self._save_threads()
+        return cleared

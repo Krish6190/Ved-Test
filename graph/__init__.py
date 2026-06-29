@@ -3,17 +3,19 @@ from langgraph.prebuilt import ToolNode
 from langchain_core.messages import AIMessage
 
 from .state import VedState
-from .nodes import intent_router_node, chat_node, python_tool_node, coder_chat_node
+from .nodes import intent_router_node, chat_node, coder_chat_node
+from .nodes.planner import planner_node
+from .nodes.executor import executor_node
 from .content_generation.pipeline_node import content_pipeline_node
 from graph.tools import VED_TOOLS
 
 
 def _route_after_llm(state: VedState) -> str:
-    """Conditional edge after `chat_node` / `coder_chat_node`.
+    """Conditional edge after `chat_node` / `coder_chat_node` / `executor_node`.
 
     If the LLM's last message contains `tool_calls`, hand off to the
     `tools` node (ToolNode) which executes them and returns a ToolMessage.
-    Otherwise end the turn.
+    Otherwise end the turn (or loop back to planner for the executor).
     """
     last = state.messages[-1] if state.messages else None
     if isinstance(last, AIMessage) and getattr(last, "tool_calls", None):
@@ -22,17 +24,30 @@ def _route_after_llm(state: VedState) -> str:
 
 
 def _route_after_tools(state: VedState) -> str:
-    """After ToolNode executes, loop back to the same LLM node that called
-    the tools (chat_node for Path A, coder_chat_node for the coder mode)."""
+    """After ToolNode executes, loop back to the originating LLM node."""
     return "coder_chat_node" if state.mode == "coder" else "chat_node"
+
+
+def _route_after_planner(state: VedState) -> str:
+    """Conditional edge after `planner_node`. Reads state.route_intent
+    set by the planner:
+      - "P"        -> executor (plan just created or chunk ready)
+      - "A"        -> END (direct answer / plan complete with summary emitted)
+      - "B"        -> END (planner emitted a fallback that we route elsewhere)
+    """
+    intent = getattr(state, "route_intent", "")
+    if intent == "P":
+        return "executor_node"
+    return END
 
 
 def build_graph(get_llm):
     g = StateGraph(VedState)
     g.add_node("intent_router_node", lambda state, config: intent_router_node(state, get_llm))
+    g.add_node("planner_node", lambda state, config: planner_node(state, get_llm, config))
+    g.add_node("executor_node", lambda state, config: executor_node(state, get_llm, config))
     g.add_node("chat_node", lambda state, config: chat_node(state, get_llm, config))
     g.add_node("content_pipeline_node", lambda state, config: content_pipeline_node(state, get_llm, config))
-    g.add_node("python_tool_node", python_tool_node)
     g.add_node("coder_chat_node", lambda state, config: coder_chat_node(state, get_llm, config))
     # ToolNode executes any tool_calls emitted by the bound LLM.
     g.add_node("tools", ToolNode(VED_TOOLS))
@@ -44,30 +59,35 @@ def build_graph(get_llm):
     g.add_conditional_edges(
         "intent_router_node",
         lambda state: state.route_intent,
-        {"A": "chat_node", "B": "content_pipeline_node", "C": "python_tool_node"}
+        {"A": "planner_node", "B": "content_pipeline_node"},
     )
-    # coder_chat_node: explicit "/run ..." still goes to python_tool_node;
-    # otherwise the LLM decides what to do (including calling tools).
+
+    # Planner decides: send to executor (plan), or end (direct/finalize).
+    g.add_conditional_edges(
+        "planner_node",
+        _route_after_planner,
+        {"executor_node": "executor_node", END: END},
+    )
+    # Executor runs one chunk as a self-contained agent loop (tools
+    # executed inline). It always returns to the planner — the planner
+    # reads the chunk output + structured tool_calls from the plan file.
+    g.add_edge("executor_node", "planner_node")
+
+    # coder_chat_node: LLM emits tool_calls or ends. (No more /run -> C; that
+    # path is gone. /run and "execute ..." now flow through Path A.)
     g.add_conditional_edges(
         "coder_chat_node",
-        lambda state: (
-            "python_tool_node"
-            if state.route_intent == "C"
-            else _route_after_llm(state)
-        ),
-        {"python_tool_node": "python_tool_node", "tools": "tools", END: END}
+        _route_after_llm,
+        {"tools": "tools", END: END},
     )
-    g.add_conditional_edges(
-        "python_tool_node",
-        lambda state: "coder_chat_node" if state.mode == "coder" else "chat_node"
-    )
+
     # chat_node: route to ToolNode if the LLM emitted tool_calls, else END.
     g.add_conditional_edges(
         "chat_node",
         _route_after_llm,
         {"tools": "tools", END: END}
     )
-    # ToolNode loops back to the LLM that called it (so it sees the result).
+    # ToolNode loops back to the originating LLM.
     g.add_conditional_edges(
         "tools",
         _route_after_tools,
