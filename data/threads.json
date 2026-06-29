@@ -19,6 +19,14 @@
       {
         "role": "ai",
         "content": "I don't see any contents in the attached file. Can you please provide more information about what you're looking for?"
+      },
+      {
+        "role": "human",
+        "content": "read the haqms folder readme file and tell me about the project"
+      },
+      {
+        "role": "ai",
+        "content": "The project appears to be related to a skill-building platform, but without more information about the specific details of the project, it is challenging to provide a meaningful response."
       }
     ]
   }

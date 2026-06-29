@@ -232,9 +232,15 @@ _PLANNER_SYSTEM = SystemMessage(content=(
        "  - When in doubt, prefer CREATE_PLAN over DIRECT_ANSWER. The plan\n"
        "can be one chunk if it's truly simple; DIRECT_ANSWER skips the\n"
        "executor entirely so the user gets no tool support at all.\n"
-       "  - Before deciding, call retrieve_rag if the user's message\n"
-       "references past context ('as we discussed', 'the bug from\n"
-       "yesterday', etc.) so you don't miss it.\n"
+       "  - retrieve_rag is for PAST CHAT (prior AI responses, files\n"
+       "uploaded to the thread). It does NOT contain files on disk\n"
+       "unless they were uploaded. Use it for past-chat references\n"
+       "('as we discussed', 'what did you tell me about X'). An empty\n"
+       "result means 'no record' — only then is DIRECT_ANSWER right for\n"
+       "those queries. But 'read the X file', 'find the Y folder',\n"
+       "'open Z': those are TOOL tasks — the executor has read_file +\n"
+       "search_files. Emit CREATE_PLAN, regardless of whether\n"
+       "retrieve_rag returned anything.\n"
 ))
 
 
