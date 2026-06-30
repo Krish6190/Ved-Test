@@ -60,9 +60,6 @@ def content_pipeline_node(state: VedState, get_llm, config: RunnableConfig) -> d
             "critique": current_state.critique_notes
         })
 
-        if current_state.route_intent == "C":
-            current_state = current_state.model_copy(update={"route_intent": "B"})
-
         # Stream the per-pass draft to the UI so the user can see what they're judging.
         pass_label = f"### Pass {current_state.loop_count + 1}/3 (Score: {current_state.content_score}/100)\n\n"
         if token_queue:

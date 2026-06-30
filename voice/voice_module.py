@@ -62,7 +62,7 @@ class VoiceSystem:
         # self._needs_calibration on its first iteration and invokes
         # self.calibrate_ambient_noise(stream=stream, duration_s=1.0) using
         # the live InputStream, then clears the flag in a finally block.
-        self.silence_threshold = 200
+        self.silence_threshold = 360
         self._needs_calibration = True
 
         # Interruptible TTS (Chunk C).

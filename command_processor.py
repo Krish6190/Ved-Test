@@ -24,7 +24,8 @@ class ChatbotCommandProcessor:
             self._hibernating = (target_mode == "hibernate")
             self._llm_cache.clear()
             try:
-                requests.post(f"{os.getenv('OLLAMA_BASE_URL', 'http://localhost:11434')}/api/generate", json={"model": "qwen2.5-coder:7b", "keep_alive": 0}, timeout=5)
+                coder_model_name = self.adapters["coder"].model_name
+                requests.post(f"{os.getenv('OLLAMA_BASE_URL', 'http://localhost:11434')}/api/generate", json={"model": coder_model_name, "keep_alive": 0}, timeout=5)
             except Exception:
                 pass
             self.set_mode(target_mode)

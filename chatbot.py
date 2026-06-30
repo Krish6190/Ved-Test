@@ -415,6 +415,10 @@ class Chatbot(ChatbotCommandProcessor):
     def respond(self, message: str):
         cmd_resp = self.handle_command(message)
         if cmd_resp is not None:
+            if isinstance(cmd_resp, str):
+                active = self.get_active_thread()
+                active["messages"].append(AIMessage(content=cmd_resp))
+                self._save_threads()
             return cmd_resp
         if self._hibernating:
             return "(hibernate) Bot is currently hibernating. Use /wake to wake."
@@ -493,19 +497,27 @@ class Chatbot(ChatbotCommandProcessor):
                 # in-memory content with a head+tail summary. ToolMessage
                 # results are kept verbatim so the LLM can see them on the
                 # next turn.
+                # This is run off the request thread (daemon) because the
+                # embedding call + FAISS update can take 2-3s on larger
+                # drafts; the RAG store is for future turns, not this one,
+                # so the GUI shouldn't block on it.
                 active_thread_id = active.get("id")
-                for msg in list(active["messages"]):
-                    if isinstance(msg, AIMessage):
-                        full_content = msg.content if isinstance(msg.content, str) else str(msg.content)
-                        if len(full_content) > _AI_SUMMARY_THRESHOLD_CHARS and active_thread_id:
-                            # Inject full content into RAG (best-effort).
-                            source_label = f"ai_response_{int(time.time())}_{secrets.token_hex(3)}"
-                            _save_ai_response_to_thread_rag(
-                                active_thread_id, full_content, source_label
-                            )
-                            # Replace content with summary in place.
-                            msg.content = _compress_ai_content(full_content)
-                self._save_threads()
+                def _compress_and_save(messages_snapshot, thread_id):
+                    for msg in messages_snapshot:
+                        if isinstance(msg, AIMessage):
+                            full_content = msg.content if isinstance(msg.content, str) else str(msg.content)
+                            if len(full_content) > _AI_SUMMARY_THRESHOLD_CHARS and thread_id:
+                                source_label = f"ai_response_{int(time.time())}_{secrets.token_hex(3)}"
+                                _save_ai_response_to_thread_rag(
+                                    thread_id, full_content, source_label
+                                )
+                                msg.content = _compress_ai_content(full_content)
+                    self._save_threads()
+                threading.Thread(
+                    target=_compress_and_save,
+                    args=(list(active["messages"]), active_thread_id),
+                    daemon=True,
+                ).start()
             if "saved_memories" in accumulated_state:
                 self.saved_memories = accumulated_state["saved_memories"]
             ollama_active = ["None"]

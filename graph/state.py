@@ -31,7 +31,7 @@ def limit_messages(left: Sequence[BaseMessage], right: Sequence[BaseMessage]) ->
 
 class VedState(BaseModel):
     messages: Annotated[Sequence[BaseMessage], limit_messages]
-    route_intent: Literal["A", "B", "C", ""] = Field(default="")
+    route_intent: Literal["A", "B", "C", "P", ""] = Field(default="")
     current_draft: str = Field(default="")
     critique_notes: str = Field(default="")
     content_score: int = Field(default=0)

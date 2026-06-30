@@ -5,7 +5,7 @@ import numpy as np
 import sounddevice as sd
 import winsound
 WAKE_THRESHOLD = 0.45           
-WAKE_REQUIRED_HITS = 3          
+WAKE_REQUIRED_HITS = 2     
 WAKE_COOLDOWN_SECONDS = 2.0     
 
 def evaluate_wake_hit(score, current_hits, now, cooldown_until):
