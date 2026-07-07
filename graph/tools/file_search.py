@@ -12,12 +12,9 @@ Two modes, toggled by `state.self_healing`:
 
 The `pattern` argument is OPTIONAL. If omitted, the tool extracts a likely
 filename pattern from the last user message (e.g. "config.py" or the last
-meaningful word) and uses that as the glob. The 3-strategy `find_files()`
-helper (exact glob, case-insensitive name match, full-path substring) is
-used for both explicit and inferred patterns so `readme` matches
-`README.md`.
-
-Results capped at 100 paths per call.
+meaningful word) and uses that as the glob. The actual search delegates to
+`search_files_action` in graph/actions/, which uses the same 3-strategy
+matcher (exact glob, case-insensitive name match, full-path substring).
 """
 from pathlib import Path
 from typing import Annotated
@@ -25,12 +22,13 @@ from typing import Annotated
 from langchain_core.tools import tool
 from langgraph.prebuilt import InjectedState
 
+from graph.actions.filesystem import search_files_action
 from graph.state import VedState
 from graph.tools._common import (
+    ALWAYS_SKIP_DIRS,
     MAX_RESULTS,
     PROJECT_ROOT,
     extract_search_pattern,
-    find_files,
     is_safe_default,
     is_safe_self_healing,
     last_user_message_text,
@@ -91,13 +89,16 @@ def search_files(
             f"insufficient permissions."
         )
 
-    if not base.exists():
-        return f"ERROR: Directory not found: `{base}`"
-
-    try:
-        matches = find_files(base, pattern, limit=MAX_RESULTS)
-    except Exception as exc:
-        return f"ERROR: Search failed: {exc}"
+    skip_dirs = tuple(sorted(ALWAYS_SKIP_DIRS))
+    raw = search_files_action(
+        pattern,
+        directory=str(base),
+        skip_dirs=skip_dirs,
+        max_results=MAX_RESULTS,
+    )
+    if raw.startswith("ERROR:"):
+        return raw
+    matches = [m for m in raw.split("\n") if m]
 
     if not matches:
         return f"ERROR: No files matched '{pattern}' in '{base}'. Try a broader pattern."

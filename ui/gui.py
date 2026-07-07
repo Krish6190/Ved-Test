@@ -12,12 +12,43 @@ from chatbot import Chatbot
 from .gui_rag_worker import VedRagWorker
 from .components import MODE_COLORS
 
+# Telemetry — registers an active-user session on GUI startup, sends
+# heartbeats on each prompt, and ends the session when the window closes.
+# All calls are best-effort: if telemetry can't be imported or fails, the
+# GUI keeps working normally.
+try:
+    from telemetry import telemetry as _telemetry
+except Exception:  # pragma: no cover - import-failure fallback
+    _telemetry = None
+
 MODE_COMMANDS = {"/activate coder", "/deactivate coder", "/sleep", "/hibernate", "/wake", "/resume"}
 
 class VedWidget(VedRagWorker):
     def __init__(self, root: tk.Tk):
         super().__init__(root)
         self.chatbot = Chatbot()
+        # Wire the UI components into the chatbot so command_processor._handle_cd()
+        # can push cwd updates to the title-bar chip, and on_session_start()
+        # can push index-status updates. Both chips get seeded with their
+        # initial values here. Best-effort: failures don't block startup.
+        try:
+            self.chatbot.set_ui_components(self)
+        except Exception:
+            pass
+        # Telemetry: register this GUI window as an active session.
+        # The session_id is stored so the close handler can end exactly
+        # this session without touching other clients (API, other GUIs).
+        self._telemetry_session_id: str | None = None
+        try:
+            if _telemetry is not None:
+                self._telemetry_session_id = _telemetry.start_session(
+                    username=os.getenv("VED_USERNAME", os.getenv("USERNAME", "anonymous")),
+                    source="gui",
+                    mode=self.chatbot.mode,
+                    meta={"pid": os.getpid()},
+                )
+        except Exception:
+            pass
         self.current_mode = self.chatbot.mode
         self.chat_history = []
         self.is_generating = False
@@ -328,6 +359,15 @@ class VedWidget(VedRagWorker):
         if not prompt and not pending:
             return
 
+        # Telemetry: any prompt the user actually sends counts as activity.
+        # Refresh the heartbeat so idle-timeout doesn't mark this session
+        # inactive while the user is actively chatting.
+        try:
+            if _telemetry is not None and getattr(self, "_telemetry_session_id", None):
+                _telemetry.heartbeat(session_id=self._telemetry_session_id)
+        except Exception:
+            pass
+
         # Ingest staged files synchronously so the LLM's RAG query sees them.
         if pending:
             print(f"[Send] Ingesting {len(pending)} attachment(s) before sending prompt...", flush=True)
@@ -370,7 +410,7 @@ class VedWidget(VedRagWorker):
             )
             if thread_id and getattr(self.chatbot, "_thread_files", None):
                 try:
-                    entry = self.chatbot._thread_files.add_text(thread_id, prompt, source_label)
+                    entry = self.chatbot._thread_files.add_text(thread_id, prompt, source_label, chunker=self.chatbot._rag_chunker())
                     evicted = entry.get("evicted", [])
                     print(
                         f"[Paste] {len(prompt)} chars → {entry['chunk_count']} chunks "
@@ -607,5 +647,36 @@ class VedWidget(VedRagWorker):
 
 def main():
     root = tk.Tk()
-    VedWidget(root)
-    root.mainloop()
+    widget = VedWidget(root)
+
+    # Telemetry: end the active-user session when the window is closed
+    # (either via WM_DELETE_WINDOW or a normal mainloop exit). Bound
+    # before mainloop so the close handler always fires.
+    def _on_close():
+        try:
+            if _telemetry is not None:
+                sid = getattr(widget, "_telemetry_session_id", None)
+                if sid:
+                    _telemetry.end_session(session_id=sid)
+                _telemetry.shutdown()
+        except Exception:
+            pass
+        try:
+            root.destroy()
+        except Exception:
+            pass
+
+    root.protocol("WM_DELETE_WINDOW", _on_close)
+    try:
+        root.mainloop()
+    finally:
+        # Belt-and-braces: if mainloop exits via something other than
+        # WM_DELETE_WINDOW (e.g. root.quit()), still close the session.
+        try:
+            if _telemetry is not None:
+                sid = getattr(widget, "_telemetry_session_id", None)
+                if sid:
+                    _telemetry.end_session(session_id=sid)
+                _telemetry.shutdown()
+        except Exception:
+            pass

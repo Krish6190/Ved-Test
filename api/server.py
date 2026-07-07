@@ -42,6 +42,8 @@ from api.schemas import (
     RunOut,
     ToolCreationApprovalReq,
     SetModeReq,
+    TelemetryOut,
+    ActiveUserOut,
     ThreadFileOut,
     ThreadOut,
 )
@@ -74,6 +76,55 @@ async def _shutdown() -> None:
 async def health() -> HealthOut:
     """Does NOT touch the chatbot; safe to call while Ollama is down."""
     return HealthOut(status="ok")
+
+
+# ---- Telemetry ----
+
+@app.get("/telemetry/active", response_model=TelemetryOut)
+async def telemetry_active() -> TelemetryOut:
+    """Return active-user count and the list of currently-active sessions.
+
+    A session counts as active if its last heartbeat was within the
+    telemetry timeout (default 5 minutes, tunable via the
+    ``VED_TELEMETRY_TIMEOUT`` env var). Heartbeats are emitted by the GUI
+    on every prompt and on every successful ``/chat`` call to this
+    server, so an idle client naturally drops off the count after the
+    timeout.
+
+    This endpoint never touches the chatbot, so it's safe to call while
+    Ollama is down or the chatbot hasn't been constructed yet.
+    """
+    from telemetry import telemetry as _telemetry
+    users = _telemetry.get_active_users()
+    from telemetry import ACTIVE_TIMEOUT_SECONDS
+    return TelemetryOut(
+        active_count=len(users),
+        active_users=[ActiveUserOut(**u) for u in users],
+        timeout_seconds=ACTIVE_TIMEOUT_SECONDS,
+    )
+
+
+@app.post("/telemetry/heartbeat")
+async def telemetry_heartbeat(req: Request) -> dict:
+    """Record an API-client heartbeat. The caller may pass a username via
+    JSON body (``{"username": "alice"}``) or ``X-Ved-Username`` header.
+
+    If neither is provided, the session is recorded as ``"anonymous"``.
+    Returns the new active-user count.
+    """
+    from telemetry import telemetry as _telemetry
+    username = "anonymous"
+    try:
+        body = await req.json()
+        if isinstance(body, dict) and body.get("username"):
+            username = str(body["username"])
+    except Exception:
+        pass
+    if username == "anonymous":
+        username = req.headers.get("X-Ved-Username", "anonymous")
+    sid = _telemetry.start_session(username=username, source="api")
+    _telemetry.heartbeat(session_id=sid)
+    return {"resolved": True, "session_id": sid, "active_count": _telemetry.get_active_count()}
 
 
 # ---- Helpers ----

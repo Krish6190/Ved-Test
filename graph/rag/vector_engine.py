@@ -11,7 +11,7 @@ GLOBAL_SCOPE = "__GLOBAL__"
 
 class LocalVectorDB:
     def __init__(self):
-        self.db_path = os.getenv("DB_PATH", r"E:\VectorDB\index.bin")
+        self.db_path = os.getenv("DB_PATH", "data/vectordb/index.bin")
         self.file_parser = RagDocumentParser()
         self.embeddings_engine = OllamaEmbeddings(
             model="nomic-embed-text:latest",
@@ -38,10 +38,17 @@ class LocalVectorDB:
                             valid_vectors = [r["embedding"] for r in data if "embedding" in r]
                             if valid_vectors:
                                 self.vectors_matrix = np.array(valid_vectors, dtype=np.float32)
-                    # Backward compat: ensure every loaded entry has a scope.
+                    # Backward compat: ensure every loaded entry has the expected keys.
                     for record in self.registry:
-                        if isinstance(record, dict) and "scope" not in record:
-                            record["scope"] = GLOBAL_SCOPE
+                        if isinstance(record, dict):
+                            if "scope" not in record:
+                                record["scope"] = GLOBAL_SCOPE
+                            # Older records (pre-chunker-aware ingest) won't have these.
+                            record.setdefault("chunker", "text")
+                            record.setdefault("layer", "body")
+                            record.setdefault("name", "text")
+                            record.setdefault("lineno", 0)
+                            record.setdefault("end_lineno", 0)
             except Exception as e:
                 print(f"[RAG Engine] Binary cache reading warning: {e}")
 
@@ -53,23 +60,72 @@ class LocalVectorDB:
         except Exception as e:
             print(f"[RAG Engine] Disk write warning: {e}")
 
-    def ingest_local_file(self, file_path: str, scope: str = GLOBAL_SCOPE):
-        chunks = self.file_parser.process_file_to_chunks(file_path)
-        if not chunks: return
+    def ingest_local_file(self, file_path: str, scope: str = GLOBAL_SCOPE, chunker: str = "text", source: str | None = None):
+        """Read a local file and ingest its chunks into the vector DB.
+
+        Args:
+            file_path: Path to the source file on disk.
+            scope: Registry scope tag (typically the thread id or GLOBAL_SCOPE).
+            chunker: "text" uses RagDocumentParser.process_file_to_chunks (the
+                original behavior). "ast" uses graph.rag.code_chunker.chunk_file
+                for AST-aware 2-layer chunking (signatures + bodies).
+            source: Registry `source` label stored on every chunk. If None, we
+                fall back to os.path.basename(file_path). Callers should pass an
+                explicit basename so delete_by_source can evict by source later.
+        """
+        if chunker == "ast":
+            try:
+                from graph.rag.code_chunker import chunk_file
+                raw_chunks = chunk_file(file_path)
+            except Exception as e:
+                print(f"[RAG Engine] AST chunking failed for {file_path}: {e}")
+                return
+            records = []
+            for c in raw_chunks:
+                content = (c.get("content") or "").strip()
+                if not content:
+                    continue
+                records.append({
+                    "content": content,
+                    "source": source if source is not None else os.path.basename(file_path),
+                    "scope": scope,
+                    "chunker": "ast",
+                    "layer": c.get("layer", "body"),
+                    "name": c.get("name", ""),
+                    "lineno": int(c.get("lineno", 0) or 0),
+                    "end_lineno": int(c.get("end_lineno", 0) or 0),
+                })
+        else:
+            chunks = self.file_parser.process_file_to_chunks(file_path)
+            records = []
+            for c in chunks:
+                content = c.strip()
+                if not content:
+                    continue
+                records.append({
+                    "content": content,
+                    "source": source if source is not None else os.path.basename(file_path),
+                    "scope": scope,
+                    "chunker": "text",
+                    "layer": "body",
+                    "name": "text",
+                    "lineno": 0,
+                    "end_lineno": 0,
+                })
+
+        if not records:
+            return
         existing_contents = {record["content"] for record in self.registry}
-        chunks_to_embed = [c.strip() for c in chunks if c.strip() and c.strip() not in existing_contents]
-        if not chunks_to_embed: return
+        records_to_embed = [r for r in records if r["content"] not in existing_contents]
+        if not records_to_embed:
+            return
         try:
-            vectors = self.embeddings_engine.embed_documents(chunks_to_embed)
+            vectors = self.embeddings_engine.embed_documents([r["content"] for r in records_to_embed])
             new_entries = []
             new_vectors = []
-            for text, vec in zip(chunks_to_embed, vectors):
+            for rec, vec in zip(records_to_embed, vectors):
                 if vec:
-                    new_entries.append({
-                        "content": text,
-                        "source": os.path.basename(file_path),
-                        "scope": scope,
-                    })
+                    new_entries.append(rec)
                     new_vectors.append(vec)
             if new_entries:
                 new_v_arr = np.array(new_vectors, dtype=np.float32)
@@ -78,6 +134,56 @@ class LocalVectorDB:
                 self._save_database()
         except Exception as e:
             print(f"[RAG Engine] Batch vector processing exception: {e}")
+
+    def ingest_text(self, text: str, scope: str = GLOBAL_SCOPE, source: str = "raw_text", chunker: str = "text"):
+        """Embed raw text into the vector DB without going through the disk path.
+
+        Used by ThreadFileStore.add_text and the GUI paste path. The text is
+        split via the RagDocumentParser's text splitter. Each resulting chunk
+        is stored as a registry record with `chunker` (default "text") and
+        `layer="body"` so retrieval treats them like other text chunks.
+
+        `source` is required (no basename fallback because there is no file).
+        """
+        if not text or not text.strip():
+            return
+        chunks = self.file_parser.text_splitter.split_raw_text(text)
+        records = []
+        for c in chunks:
+            content = c.strip()
+            if not content:
+                continue
+            records.append({
+                "content": content,
+                "source": source,
+                "scope": scope,
+                "chunker": chunker,
+                "layer": "body",
+                "name": "text",
+                "lineno": 0,
+                "end_lineno": 0,
+            })
+        if not records:
+            return
+        existing_contents = {record["content"] for record in self.registry}
+        records_to_embed = [r for r in records if r["content"] not in existing_contents]
+        if not records_to_embed:
+            return
+        try:
+            vectors = self.embeddings_engine.embed_documents([r["content"] for r in records_to_embed])
+            new_entries = []
+            new_vectors = []
+            for rec, vec in zip(records_to_embed, vectors):
+                if vec:
+                    new_entries.append(rec)
+                    new_vectors.append(vec)
+            if new_entries:
+                new_v_arr = np.array(new_vectors, dtype=np.float32)
+                self.vectors_matrix = np.vstack([self.vectors_matrix, new_v_arr]) if self.vectors_matrix is not None else new_v_arr
+                self.registry.extend(new_entries)
+                self._save_database()
+        except Exception as e:
+            print(f"[RAG Engine] Text ingest exception: {e}")
 
     def query_similarity(self, query_text: str, k: int = 2, lambda_mult: float = 0.5, scope: str | None = None) -> list:
         if not self.registry or self.vectors_matrix is None: return []

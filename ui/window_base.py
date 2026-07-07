@@ -1,6 +1,33 @@
-import tkinter as tk
-import ctypes
-import ctypes.wintypes
+# -----------------------------------------------------------------------------
+# Guarded imports - keep this module importable on headless Linux / slim venvs
+# where tkinter (or pywebview) is not installed. The goal is that
+# `pytest --collect-only` does not crash with ModuleNotFoundError when it
+# sweeps the project tree. Instantiation will still fail if the GUI stack
+# is missing, but collection must succeed.
+# -----------------------------------------------------------------------------
+try:
+    import tkinter as tk  # type: ignore[assignment]
+except Exception:  # tkinter missing (headless Linux)
+    tk = None  # type: ignore[assignment]
+
+try:
+    import ctypes
+except Exception:
+    ctypes = None  # type: ignore[assignment]
+
+try:
+    import ctypes.wintypes  # noqa: F401  (Windows-specific; safe to import on Linux)
+except Exception:
+    pass
+
+# pywebview is used by other modules (ui.gui / app entry point) - this file
+# does not import it directly, but we leave a sentinel in case downstream
+# refactors pull it in. Importing lazily here is a no-op if pywebview is
+# absent and does not break module import.
+try:
+    import webview  # pywebview's import name; only needed by app entrypoint
+except Exception:
+    webview = None  # type: ignore[assignment]
 
 WDA_EXCLUDEFROMCAPTURE = 0x00000011
 WS_EX_APPWINDOW        = 0x00040000
@@ -115,7 +142,7 @@ class VedWindowBase:
 
         mode  = getattr(self, "current_mode", "standard")
         color = MODE_COLORS.get(mode, "#a6e3a1")
-        canvas.create_text(icon_size // 2, icon_size // 2 - 4, text="V", fill=color, font=("ONE DAY", 10, "bold"))
+        canvas.create_text(icon_size // 2, icon_size // 2 - 4, text="V", fill=color, font=("Arial", 10, "bold"))
         canvas.create_text(icon_size // 2, icon_size // 2 + 7, text=mode[:3].upper(), fill=color, font=("Segoe UI", 5, "bold"))
 
         canvas.bind("<Button-1>", self._restore_from_tray)
@@ -272,7 +299,7 @@ class VedWindowBase:
 #         mode  = getattr(self, "current_mode", "standard")
 #         color = MODE_COLORS.get(mode, "#a6e3a1")
 #         canvas.create_text(icon_size // 2, icon_size // 2 - 4, text="V",
-#                            fill=color, font=("ONE DAY", 10, "bold"))
+#                            fill=color, font=("Arial", 10, "bold"))
 #         canvas.create_text(icon_size // 2, icon_size // 2 + 7, text=mode[:3].upper(),
 #                            fill=color, font=("Segoe UI", 5, "bold"))
 

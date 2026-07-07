@@ -5,13 +5,21 @@ The `propose_tool` @tool pauses for human approval via the
 tool to `graph/tools/user_tools/<name>.py` and dynamically imports it
 into `VED_TOOLS` so the same conversation can use it immediately.
 
+The actual write/import/register work is delegated to `propose_tool_action`
+in graph/actions/tool_creator_actions.py. This tool handles:
+  - Name sanitization
+  - AST scanning for blocked imports (security check before bothering the
+    human)
+  - Duplicate-name detection
+  - SSE proposal emission + human approval wait
+  - Formatting the action's structured result into a string the LLM
+    can read.
+
 Companion to: data/thread_files.py, graph/tools/_common.py.
 """
 from __future__ import annotations
 
 import ast
-import importlib
-import inspect
 import re
 import threading
 from pathlib import Path
@@ -20,7 +28,22 @@ from typing import Annotated, List
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
 
+from graph.actions.tool_creator_actions import propose_tool_action, _register_into
 from graph.tools._common import PROJECT_ROOT
+
+_TOOLS_LOCK = threading.Lock()
+
+
+def _register_user_tool(module) -> List[str]:
+    """Back-compat shim: append every @tool in `module` to VED_TOOLS.
+
+    Kept here because `graph/tools/user_tools/__init__.py` imports it by
+    name during its dynamic loader sweep. Delegates the actual work to
+    the action layer's `_register_into`, passing VED_TOOLS explicitly.
+    """
+    from graph.tools import VED_TOOLS
+    with _TOOLS_LOCK:
+        return _register_into(module, VED_TOOLS)
 
 USER_TOOLS_DIR = PROJECT_ROOT / "graph" / "tools" / "user_tools"
 
@@ -69,38 +92,6 @@ def _safe_filename(name: str) -> str:
     s = re.sub(r"^[^a-z]+", "", s)
     s = s[:60] or "unnamed_tool"
     return s
-
-
-# ---- registration helpers ----
-_TOOLS_LOCK = threading.Lock()
-
-
-def _find_tool_decorated(module) -> list:
-    """Return every LangChain @tool object defined in `module`."""
-    from langchain_core.tools import BaseTool
-    tools = []
-    for name, obj in inspect.getmembers(module):
-        if isinstance(obj, BaseTool):
-            tools.append(obj)
-    return tools
-
-
-def _register_user_tool(module) -> List[str]:
-    """Append every @tool in `module` to VED_TOOLS. Returns names registered.
-    Thread-safe."""
-    new_tools = _find_tool_decorated(module)
-    if not new_tools:
-        return []
-    with _TOOLS_LOCK:
-        # Local import to avoid circular import at module load.
-        from graph.tools import VED_TOOLS
-        existing = {getattr(t, "name", None) for t in VED_TOOLS}
-        for t in new_tools:
-            tname = getattr(t, "name", None)
-            if tname not in existing:
-                VED_TOOLS.append(t)
-                existing.add(tname)
-    return [getattr(t, "name", repr(t)) for t in new_tools]
 
 
 @tool
@@ -157,7 +148,7 @@ def propose_tool(
     if token_queue is None or tool_event is None or tool_state is None:
         return (
             "ERROR: propose_tool invoked outside of an active chat session. "
-            "The tool requires the chatbot's approval wiring to be present."
+            "The chatbot's approval wiring to be present."
         )
 
     proposal_payload = {
@@ -180,42 +171,21 @@ def propose_tool(
     if not approved:
         return f"User rejected tool creation for '{safe_name}'. Proceed without it."
 
-    # Human approved: write, import, register.
-    try:
-        USER_TOOLS_DIR.mkdir(parents=True, exist_ok=True)
-        target_path.write_text(code, encoding="utf-8")
-    except Exception as exc:
-        return f"ERROR: Failed to write {target_path}: {exc}"
+    # Human approved: delegate the write + import + register to the action.
+    # Local import to avoid circular import at module load.
+    from graph.tools import VED_TOOLS
+    spec = {
+        "name": safe_name,
+        "code": code,
+        "register_into": VED_TOOLS,
+    }
+    result = propose_tool_action(spec, user_tools_dir=str(USER_TOOLS_DIR))
+    if not result.get("ok"):
+        return f"ERROR: {result.get('error', 'unknown action failure')}"
 
-    try:
-        module = importlib.import_module(f"graph.tools.user_tools.{safe_name}")
-    except Exception as exc:
-        # Roll back the file write so we don't leave a broken module.
-        try:
-            target_path.unlink()
-        except Exception:
-            pass
-        return f"ERROR: Failed to import the new tool module: {exc}"
-
-    try:
-        registered = _register_user_tool(module)
-    except Exception as exc:
-        return f"ERROR: Failed to register the new tool: {exc}"
-
-    if not registered:
-        # File written but no @tool found inside it. Roll back.
-        try:
-            target_path.unlink()
-        except Exception:
-            pass
-        return (
-            f"ERROR: The provided code does not define any @tool-decorated "
-            f"function. Add a `@tool` decorator to the function you want "
-            f"registered (e.g. `{safe_name}`)."
-        )
-
+    saved_to = result.get("saved_to") or str(target_path)
     return (
         f"OK: Tool '{safe_name}' registered and ready. "
         f"You may now invoke it as {safe_name}(...). "
-        f"Module path: {target_path}"
+        f"Module path: {saved_to}"
     )

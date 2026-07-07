@@ -168,6 +168,10 @@ class Chatbot(ChatbotCommandProcessor):
         self._llm_cache = {}
         self._threads = {}
         self._active_thread_id = None
+        # UI components reference — set by gui.py after the UI is built.
+        # Used by command_processor._handle_cd() to push cwd updates to the
+        # title-bar chip, and by on_session_start() to push index status.
+        self._ui_components = None
         self._load_threads()
 
         # Per-thread file quota tracker. Lazy-imported to avoid loading
@@ -355,6 +359,50 @@ class Chatbot(ChatbotCommandProcessor):
         self._llm_cache[self.mode] = llm
         return llm
 
+    def _make_planner_llm_factory(self):
+        """Return a closure `f(mode) -> ChatOllama` that the planner node
+        will call with `state.mode` to get the right model. Re-resolved
+        on every call so a `/set_mode` switch (which calls
+        `_rebuild_graph`) automatically picks up the new mode's adapter.
+        """
+        from model_adapter import get_planner_llm
+
+        def _factory(mode: str):
+            adapter = self.adapters.get(mode)
+            if adapter is None:
+                return None
+            base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+            return get_planner_llm(
+                mode,
+                base_url=base_url,
+                device=adapter.device,
+                params=adapter.params or {},
+            )
+
+        return _factory
+
+    def _make_executor_llm_factory(self):
+        """Return a closure `f(mode) -> ChatOllama` that the executor node
+        will call with `state.mode` to get the right model. Re-resolved
+        on every call so a `/set_mode` switch automatically picks up the
+        new mode's adapter.
+        """
+        from model_adapter import get_executor_llm
+
+        def _factory(mode: str):
+            adapter = self.adapters.get(mode)
+            if adapter is None:
+                return None
+            base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+            return get_executor_llm(
+                mode,
+                base_url=base_url,
+                device=adapter.device,
+                params=adapter.params or {},
+            )
+
+        return _factory
+
     def set_mode(self, mode: str):
         if mode not in MODES: raise ValueError(f"Unknown mode: {mode}")
         if self.mode == "coder" and mode in ["standard", "turbo"]:
@@ -399,6 +447,66 @@ class Chatbot(ChatbotCommandProcessor):
         from graph import build_graph
         self._graph = build_graph(self._get_llm)
 
+    def set_ui_components(self, ui_components) -> None:
+        """Wire the UI components reference and seed initial status chips.
+
+        Called by gui.py after the UI is built. Stores the reference so
+        command_processor._handle_cd() can push cwd updates to the title-
+        bar chip, and seeds both chips (cwd + index status) with their
+        initial values so the UI doesn't look stale before the first chat.
+        """
+        self._ui_components = ui_components
+        # Seed cwd chip with current working directory.
+        try:
+            if hasattr(ui_components, "set_current_directory"):
+                ui_components.set_current_directory(os.getcwd())
+        except Exception:
+            pass
+        # Seed index status chip with Idle — on_session_start will update it
+        # when the first chat triggers indexing.
+        try:
+            if hasattr(ui_components, "set_index_status"):
+                ui_components.set_index_status("Idle", "#6c7086")
+        except Exception:
+            pass
+
+    def on_session_start(self) -> None:
+        """Kick off project RAG indexing in a background thread.
+
+        Called once per session (on first chat, or from app entrypoint).
+        Returns immediately. Subsequent calls are no-ops (guarded by
+        `_project_index_started`). The indexing runs in a daemon thread
+        so it doesn't block the UI or the chat loop.
+
+        Indexing is incremental: unchanged files (by SHA-256) are skipped
+        via the hash index persisted at data/rag_index.json.
+        """
+        if getattr(self, "_project_index_started", False):
+            return
+        self._project_index_started = True
+
+        def _run():
+            try:
+                from graph.rag.vector_engine import LocalVectorDB
+                from graph.rag.project_indexer import index_workspace
+                db = LocalVectorDB()
+                # Warm up the embedding model so the first RAG query doesn't
+                # pay the model-load cost (Ollama auto-loads on first use,
+                # which can take 5-10s on cold start). Best-effort.
+                try:
+                    db.embeddings_engine.embed_query("warmup")
+                except Exception as warmup_exc:
+                    if os.getenv("VED_DEBUG"):
+                        print(f"[on_session_start] Embedding warmup skipped: {warmup_exc}", flush=True)
+                root = os.getcwd()
+                stats = index_workspace(root, db)
+                print(f"[on_session_start] Indexed project: {stats}", flush=True)
+            except Exception as e:
+                print(f"[on_session_start] Indexing failed: {e}", flush=True)
+
+        t = threading.Thread(target=_run, daemon=True, name="project-indexer")
+        t.start()
+
     def submit_tool_creation_approval(self, session_id: str, approved: bool) -> bool:
         """Resolve a pending tool-creation proposal. Returns True if a
         matching session was found, False otherwise."""
@@ -426,7 +534,7 @@ class Chatbot(ChatbotCommandProcessor):
         if adapter is None:
             return "No model available for current mode."
         def _stream_generator():
-            print("[DEBUG] stream generator started")
+            print("[DEBUG] stream generator started", flush=True)
             active = self.get_active_thread()
             was_empty = len(active["messages"]) == 0 and active["title"] == "New Thread"
             # Per-thread pinned messages are already part of `history`
@@ -452,7 +560,7 @@ class Chatbot(ChatbotCommandProcessor):
             self._human_approval_state = {"value": None}
             self._tool_creation_event = threading.Event()
             self._tool_creation_state = {"value": None, "session_id": None}
-            config = {"configurable": {"system_prompt": adapter.system_prompt + HALLUCINATION_GUARD, "token_queue": token_queue, "approval_event": self._human_approval_event, "approval_state": self._human_approval_state, "tool_creation_event": self._tool_creation_event, "tool_creation_state": self._tool_creation_state, "tool_approved": True, "active_thread_id": self._active_thread_id, "session_id": "", "set_mode": self.set_mode, "rebuild_graph": self._rebuild_graph}}
+            config = {"configurable": {"system_prompt": adapter.system_prompt + HALLUCINATION_GUARD, "token_queue": token_queue, "approval_event": self._human_approval_event, "approval_state": self._human_approval_state, "tool_creation_event": self._tool_creation_event, "tool_creation_state": self._tool_creation_state, "tool_approved": True, "active_thread_id": self._active_thread_id, "session_id": "", "set_mode": self.set_mode, "rebuild_graph": self._rebuild_graph, "planner_llm_factory": self._make_planner_llm_factory(), "executor_llm_factory": self._make_executor_llm_factory()}}
             last_node_seen = "Unknown"
             accumulated_state = dict(input_state)
             def run_graph():
@@ -528,7 +636,9 @@ class Chatbot(ChatbotCommandProcessor):
                     ollama_active = [m.get("name") for m in r.json().get("models", [])]
             except Exception:
                 ollama_active = ["Error"]
-            print(f"\n==== [VED HARDWARE DEBUG] ====\n  -> Request Mode: {self.mode.upper()}\n  -> Route completed: Node {last_node_seen}\n  -> RAM Active Models: {', '.join(ollama_active)}\n  -> Context size: {len(self._conversation_history)}\n==============================\n")
+            # Hardware debug header — prints to stdout (terminal). Safe in
+            # this codebase because tkinter doesn't capture stdout.
+            print(f"\n==== [VED HARDWARE DEBUG] ====\n  -> Request Mode: {self.mode.upper()}\n  -> Route completed: Node {last_node_seen}\n  -> RAM Active Models: {', '.join(ollama_active)}\n  -> Context size: {len(self._conversation_history)}\n==============================\n", flush=True)
         return _stream_generator()
     
     def submit_human_approval(self, approved: bool) -> None:
@@ -542,8 +652,17 @@ class Chatbot(ChatbotCommandProcessor):
             event.set()
 
     def add_global_file(self, source_path: str) -> dict:
-        """Add a file to the global store (accessible only via /upload-global)."""
-        return self._global_files.add(source_path)
+        """Add a file to the global store (accessible only via /upload-global).
+
+        The chunker is selected from the active mode: "ast" in coder mode,
+        "text" elsewhere.
+        """
+        import os as _os
+        return self._global_files.add(source_path, filename=_os.path.basename(source_path), chunker=self._rag_chunker())
+
+    def _rag_chunker(self) -> str:
+        """Return the chunker name to use for RAG ingests based on the active mode."""
+        return "ast" if self.mode == "coder" else "text"
 
     def list_global_files(self) -> list:
         return self._global_files.list_uploads()

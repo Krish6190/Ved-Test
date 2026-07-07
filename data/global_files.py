@@ -51,21 +51,23 @@ class GlobalFileStore:
     def list_uploads(self) -> List[Dict]:
         return sorted(self._load_meta(), key=lambda e: e.get("uploaded_at", 0))
 
-    def add(self, source_path: str) -> Dict:
+    def add(self, source_path: str, filename: str | None = None, chunker: str = "text") -> Dict:
         """Read file, embed chunks into vector DB (scope=__GLOBAL__), track + enforce quota.
 
         No file bytes are persisted. Raises FileNotFoundError if source missing.
+        `chunker` selects the chunking strategy ("text" or "ast"); defaults to
+        "text" to preserve legacy behavior.
         """
         from graph.rag.mixer import GLOBAL_SCOPE
 
         if not source_path or not os.path.isfile(source_path):
             raise FileNotFoundError(f"Source file not found: {source_path}")
 
-        filename = os.path.basename(source_path)
+        filename = filename or os.path.basename(source_path)
         chunks_before = self._count_chunks()
 
         try:
-            self.rag_db.ingest_local_file(source_path, scope=GLOBAL_SCOPE)
+            self.rag_db.ingest_local_file(source_path, scope=GLOBAL_SCOPE, chunker=chunker, source=filename)
         except Exception:
             chunks_after_fail = self._count_chunks()
             if chunks_after_fail > chunks_before and hasattr(self.rag_db, "delete_by_source"):

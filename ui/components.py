@@ -1,3 +1,4 @@
+import os
 import tkinter as tk
 import tkinter.font as tkfont
 from .window_base import VedWindowBase
@@ -23,9 +24,12 @@ class VedComponentLayout(VedWindowBase):
         self.mode_buttons      = {}
         self._drag_block_widgets = []
         self.thread_tab_buttons = {}
+        self.index_status_label = None  # "Project indexed: N files" chip
+        self.cwd_label = None  # "current directory" chip in title bar
 
     def _build_ui_layout(self, mode_click_cb, thread_callbacks=None):
         self._build_title_bar(mode_click_cb)
+        self._build_cwd_bar()
         input_frame = self._build_input_bar()
         self._build_content_area(thread_callbacks=thread_callbacks)
         return input_frame
@@ -40,7 +44,7 @@ class VedComponentLayout(VedWindowBase):
 
         title_label = tk.Label(
             title_bar, text="  ● VED", bg="#12131b", fg="#e5e9f0",
-            font=("ONE DAY", 10, "bold"), anchor="w"
+            font=("Arial", 10, "bold"), anchor="w"
         )
         title_label.pack(side="left", padx=6)
         self._bind_title_drag(title_label)
@@ -53,6 +57,7 @@ class VedComponentLayout(VedWindowBase):
         right_group.pack(side="right", padx=8)
 
         self._build_mode_buttons(right_group, mode_click_cb)
+        self._build_index_status(right_group)
         self._build_window_controls(right_group)
 
     def _build_mode_buttons(self, parent, mode_click_cb):
@@ -75,6 +80,78 @@ class VedComponentLayout(VedWindowBase):
 
             self.mode_buttons[mode] = btn
 
+    def _build_index_status(self, parent):
+        """Small status chip showing project-RAG indexing state.
+
+        States (text + color):
+          - "Indexing..." (yellow) while background thread runs
+          - "Indexed: N files" (green) when complete
+          - "Idle" (gray) initially or when index is fresh
+          - "Index error" (red) on failure
+
+        Wired from chatbot.on_session_start via set_index_status().
+        """
+        frame = tk.Frame(parent, bg="#12131b")
+        frame.pack(side="left", padx=4)
+        self.index_status_label = tk.Label(
+            frame, text="📂 Idle", bg="#12131b", fg="#6c7086",
+            font=("Segoe UI", 9), padx=4,
+        )
+        self.index_status_label.pack(side="left")
+
+    def _build_cwd_bar(self):
+        """Thin bar between the title bar and the content/threads area.
+
+        Houses the cwd chip ("📁 <path>") so it doesn't crowd the title
+        bar's mode buttons and has room for longer paths. Sits between
+        the title bar (above) and the content area (below).
+
+        Pack order: _build_ui_layout calls _build_title_bar first (packs
+        to top), then _build_cwd_bar (packs to top, appears below the
+        title bar naturally), then _build_content_area (expands below).
+        """
+        bar = tk.Frame(self.root, bg="#0f1018", height=22)
+        bar.pack(fill="x", side="top")
+        bar.pack_propagate(False)
+        self._build_cwd_display(bar)
+
+    def _build_cwd_display(self, parent):
+        """Current-working-directory chip in its own bar (below the title).
+
+        Shows "📁 <cwd>" with a muted foreground. Updates when the
+        chatbot changes directory via the /cd command. The chip sits in
+        its own thin bar so long paths don't push the title bar's mode
+        buttons around.
+        """
+        try:
+            initial = os.getcwd()
+        except Exception:
+            initial = "(unknown)"
+        self.cwd_label = tk.Label(
+            parent, text=f"📁 {initial}", bg="#0f1018", fg="#a6adc8",
+            font=("Segoe UI", 9), padx=8, anchor="w",
+        )
+        self.cwd_label.pack(side="left", padx=4, fill="x", expand=True)
+        self._drag_block_widgets.append(self.cwd_label)
+
+    def set_current_directory(self, path: str) -> None:
+        """Update the cwd chip. Safe to call before UI build."""
+        if self.cwd_label is None:
+            return
+        try:
+            self.cwd_label.config(text=f"📁 {path}")
+        except Exception:
+            pass
+
+    def set_index_status(self, text: str, color: str = "#a6e3a1") -> None:
+        """Update the project-index status chip. Safe to call before UI build."""
+        if self.index_status_label is None:
+            return
+        try:
+            self.index_status_label.config(text=text, fg=color)
+        except Exception:
+            pass
+
     def _build_window_controls(self, parent):
         for text, fg, cmd in [
             ("—", "#f9e2af", self._safe_minimize),
@@ -83,7 +160,7 @@ class VedComponentLayout(VedWindowBase):
             btn = tk.Button(
                 parent, text=text, bg="#12131b", fg=fg, bd=0,
                 activebackground="#12131b", activeforeground=fg,
-                font=("ONE DAY", 11), command=cmd
+                font=("Arial", 11), command=cmd
             )
             btn.pack(side="left", padx=(2 if text == "—" else 6))
             btn.bind("<B1-Motion>", lambda ev: "break")

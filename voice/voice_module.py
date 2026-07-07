@@ -3,12 +3,7 @@ from pathlib import Path
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 import os
 import threading
-import tkinter as tk
 import numpy as np
-from faster_whisper import WhisperModel
-import openwakeword
-from openwakeword.model import Model as OWWModel
-from piper import PiperVoice
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -40,6 +35,17 @@ def _compute_silence_threshold(rms_samples):
 
 class VoiceSystem:
     def __init__(self, root, input_frame, input_entry, send_command):
+        # tkinter and the heavy voice backends (faster_whisper, openwakeword,
+        # piper) are imported lazily so this module can be imported (e.g.
+        # during `pytest --collect-only` on headless Linux) without
+        # requiring the tk runtime or any of the heavy voice deps to be
+        # installed. The UI mic button and the audio pipeline are the only
+        # consumers; deferring the imports keeps the module surface clean.
+        import tkinter as tk
+        from faster_whisper import WhisperModel
+        from openwakeword.model import Model as OWWModel
+        from piper import PiperVoice
+
         self.root = root
         self.input_frame = input_frame
         self.input_entry = input_entry
@@ -90,7 +96,7 @@ class VoiceSystem:
         self.mic_button = tk.Button(
             self.input_frame, text="🎙", bg="#12131b", fg="#a6adc8", bd=0,
             activebackground="#1e1e2e", activeforeground="#b4befe",
-            font=("ONE DAY", 12), cursor="hand2", width=3, justify="center" 
+            font=("Arial", 12), cursor="hand2", width=3, justify="center"
         )
         self.mic_button.pack(side="right", padx=(0,5), pady=5)
         self.mic_button.config(command=self.toggle_listening)

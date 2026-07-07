@@ -97,3 +97,21 @@ class RunOut(BaseModel):
     duration_seconds: float
     truncated_stdout: bool
     truncated_stderr: bool
+
+
+# ---- Telemetry ----
+
+class ActiveUserOut(BaseModel):
+    username: str
+    session_id: str
+    source: str
+    mode: str
+    started_at: float
+    last_heartbeat: float
+    meta: dict = Field(default_factory=dict)
+
+
+class TelemetryOut(BaseModel):
+    active_count: int
+    active_users: List[ActiveUserOut]
+    timeout_seconds: float

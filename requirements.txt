@@ -5,6 +5,7 @@
    langchain-core>=0.2.0
    langchain-community>=0.2.0
    langchain-ollama>=0.1.0
+langchain-openai>=0.1.0  # OpenRouter cloud routing (USE_CLOUD_API=true)
    langchain-text-splitters>=0.2.0
    pyyaml>=6.0
    pydantic>=2.0.0

@@ -51,6 +51,8 @@ def retrieve_rag(
     query: str,
     scope: Annotated[Optional[str], "Thread id to search. None = active thread."] = None,
     k: Annotated[int, "Number of chunks to retrieve (default 5)."] = 5,
+    layer: Annotated[Optional[str], "Filter by chunk layer: 'sig' (signatures only), 'body' (bodies only), or None (both)."] = None,
+    paths: Annotated[Optional[List[str]], "Restrict to chunks whose source path starts with one of these prefixes (e.g. ['voice/', 'src/']). None = no path filter."] = None,
     config: Annotated[RunnableConfig, "injected"] = None,
 ) -> str:
     """Pull relevant chunks from the thread's RAG store.
@@ -59,6 +61,12 @@ def retrieve_rag(
       query: free-form search string (semantic match against stored chunks).
       scope: thread id; if None, uses the active thread from config.
       k: how many chunks to return (default 5).
+      layer: optional layer filter — 'sig' for function/class signatures only
+        (cheap navigation), 'body' for implementations only, None for both.
+      paths: optional list of path prefixes to restrict results to (e.g.
+        ['voice/'] for "only stuff in the voice folder"). Backward-compat:
+        old entries have just a filename as source and won't match any
+        directory prefix, so they're effectively excluded when paths is set.
 
     Returns:
       Formatted string of retrieved chunks (truncated per chunk). If no
@@ -84,10 +92,72 @@ def retrieve_rag(
     except Exception as exc:
         return f"ERROR: retrieve_rag failed: {exc}"
 
+    # Resolve the caller's mode from config (same place active_thread_id comes
+    # from). Falls back to empty string if config doesn't carry it, which
+    # disables the project fallback — Path A's chat calls never have mode
+    # in their config so they correctly lose the project scope here.
+    caller_mode = ""
+    if config:
+        try:
+            conf = (config.get("configurable") or {}) if isinstance(config, dict) else {}
+            caller_mode = (conf.get("state_mode") or conf.get("mode") or "").lower()
+        except Exception:
+            pass
+
+    # Project-scope fallback: ONLY for coder mode. Path A (standard/turbo)
+    # keeps retrieve_rag for thread-scoped past-chat memory but does NOT
+    # fall back to the project indexer — codebase discovery in Path A goes
+    # through search_files / read_file instead.
+    if not chunks and thread_id and caller_mode == "coder":
+        try:
+            from graph.rag.rag_db import rag_db  # the LocalVectorDB instance
+            project_results = rag_db.query_similarity(
+                query.strip(), k=max(1, min(k, 20)), scope="project",
+            ) or []
+        except Exception:
+            project_results = []
+        if paths:
+            prefixes = [p.replace("\\", "/").rstrip("/") + "/" for p in paths if p]
+            def _matches(source: str) -> bool:
+                src = (source or "").replace("\\", "/")
+                return any(src.startswith(pref) or src == pref.rstrip("/")
+                           for pref in prefixes)
+            project_results = [c for c in project_results
+                               if _matches(c.get("source", ""))]
+        if project_results:
+            for c in project_results:
+                c["scope"] = "project"
+            chunks = project_results
+
+    # Client-side layer filtering. No-op until code_chunker is wired into
+    # LocalVectorDB (Phase 2.2+2.4 wiring — chunks currently have no 'layer'
+    # field, so this filter passes everything when layer=None and drops
+    # everything when layer is set). Safe to keep in place.
+    if layer is not None and chunks:
+        filtered = [c for c in chunks if c.get("layer") == layer]
+        chunks = filtered
+
+    # Client-side path filtering. Restricts results to chunks whose source
+    # path starts with one of the provided prefixes. Used for scoped queries
+    # like "fix voice in voice folder" — only chunks from that folder match.
+    if paths and chunks:
+        prefixes = [p.replace("\\", "/").rstrip("/") + "/" for p in paths if p]
+        if prefixes:
+            def _matches_prefix(source: str) -> bool:
+                src = (source or "").replace("\\", "/")
+                return any(src.startswith(pref) or src == pref.rstrip("/") for pref in prefixes)
+            chunks = [c for c in chunks if _matches_prefix(c.get("source", ""))]
+
     if not chunks:
+        suffix = ""
+        if layer:
+            suffix += f" (layer={layer})"
+        if paths:
+            suffix += f" (paths={paths})"
         return (
             f"No RAG chunks found matching '{query}'"
             + (f" in thread {thread_id[:8]}" if thread_id else ".")
+            + suffix
         )
 
     # Format the chunks. Reuse the project standard formatter so the LLM sees

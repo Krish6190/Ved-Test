@@ -7,33 +7,30 @@ is injected via `InjectedState`.
 
 The tool:
   1. Shows a tkinter approval popup showing the code (user must OK).
-  2. Writes the code to a temp file in the OS temp dir.
-  3. Runs it in a subprocess with the current Python interpreter.
-  4. Captures stdout+stderr with a 10-second hard timeout.
-  5. Cleans up the temp file.
+  2. Delegates the actual subprocess run to `execute_python_action` in
+     graph/actions/, which writes the code to a temp file, runs it with
+     the current Python interpreter, captures stdout+stderr, and enforces
+     a 10-second hard timeout.
+  3. Formats the action's structured result back into the string format
+     the LLM expects.
 
 The `code` argument is OPTIONAL. If omitted, the tool scans the last AI
 message for a ```python ... ``` fence and uses that body. This makes it
 trivial for the agent to execute code it just emitted without re-typing it.
 
-The user must explicitly approve every execution — this is destructive and
+The user must explicitly approve every execution - this is destructive and
 untrusted by definition.
 """
-import os
-import subprocess
-import sys
 import tkinter as tk
-from pathlib import Path
-from tkinter import messagebox
 from typing import Annotated
 
 from langchain_core.tools import tool
 from langgraph.prebuilt import InjectedState
 
+from graph.actions.process import execute_python_action
 from graph.state import VedState
 from graph.tools._common import resolve_implicit_python_code
 
-_TEMP_DIR = os.environ.get("TEMP") or os.environ.get("TMP") or "C:\\Temp"
 _TIMEOUT_SECONDS = 10
 
 
@@ -53,10 +50,6 @@ def _request_approval(code: str) -> bool:
     # ---- SSE / FastAPI path ----
     try:
         from langchain_core.runnables import RunnableConfig  # noqa: F401
-        # The graph node passes RunnableConfig to tool calls when bound via
-        # `llm.bind_tools(VED_TOOLS)`. We can't access the call's config from
-        # here directly (LangChain strips it from the tool args before invoking),
-        # so we rely on a thread-local set by the node.
         from graph.tools._common import get_current_runtime_config
         cfg = get_current_runtime_config() or {}
         conf = cfg.get("configurable", {}) or {}
@@ -99,6 +92,30 @@ def _request_approval(code: str) -> bool:
     except Exception:
         return False  # secure fallback: deny on UI failure
 
+
+def _format_action_result(result: dict) -> str:
+    """Convert the action's dict result into the legacy string format.
+
+    This keeps the existing tool contracts intact (test_tools.py asserts on
+    specific prefixes like "OK:", "ERROR:", and "timeout").
+    """
+    if result.get("timed_out"):
+        return (
+            f"ERROR: Terminal process terminated - hardware timeout gate "
+            f"({_TIMEOUT_SECONDS}s) exceeded."
+        )
+    stdout = (result.get("stdout") or "").strip()
+    exit_code = result.get("exit_code", 0)
+    if exit_code != 0:
+        # Surface whatever the process produced plus the failure signal.
+        if stdout:
+            return f"ERROR: {stdout}"
+        return f"ERROR: Process exited with code {exit_code}"
+    if not stdout:
+        return "OK: Process completed successfully but produced no stdout output."
+    return f"OK:\n{stdout}"
+
+
 @tool
 def execute_python(
     code: str = "",
@@ -137,34 +154,5 @@ def execute_python(
     if not _request_approval(raw_code):
         return "ERROR: User denied execution authorization."
 
-    os.makedirs(_TEMP_DIR, exist_ok=True)
-    temp_script = os.path.join(_TEMP_DIR, "ved_runtime_exec.py")
-
-    terminal_output = ""
-    try:
-        Path(temp_script).write_text(raw_code, encoding="utf-8")
-        result = subprocess.run(
-            [sys.executable, "-u", temp_script],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            timeout=_TIMEOUT_SECONDS,
-        )
-        terminal_output = result.stdout
-    except subprocess.TimeoutExpired:
-        terminal_output = (
-            f"ERROR: Terminal process terminated - hardware timeout gate "
-            f"({_TIMEOUT_SECONDS}s) exceeded."
-        )
-    except Exception as exc:
-        terminal_output = f"ERROR: {exc}"
-    finally:
-        try:
-            if os.path.exists(temp_script):
-                os.remove(temp_script)
-        except Exception:
-            pass
-
-    if not terminal_output.strip():
-        return "OK: Process completed successfully but produced no stdout output."
-    return f"OK:\n{terminal_output.strip()}"
+    result = execute_python_action(raw_code, timeout_seconds=_TIMEOUT_SECONDS)
+    return _format_action_result(result)

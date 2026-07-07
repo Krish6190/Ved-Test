@@ -14,7 +14,7 @@ last user message for a filename hint and globs the project for it. If
 nothing is found, it returns a clear "couldn't find file" error so the LLM
 can re-plan.
 
-Output is truncated at 8000 chars to keep prompts bounded.
+The actual read is delegated to `read_file_action` in graph/actions/.
 """
 from pathlib import Path
 from typing import Annotated
@@ -22,16 +22,14 @@ from typing import Annotated
 from langchain_core.tools import tool
 from langgraph.prebuilt import InjectedState
 
+from graph.actions.filesystem import read_file_action
 from graph.state import VedState
 from graph.tools._common import (
-    ALWAYS_SKIP_DIRS,
     PROJECT_ROOT,
     is_safe_default,
     is_safe_self_healing,
     resolve_implicit_target,
 )
-
-_MAX_CHARS = 8000
 
 
 @tool
@@ -80,21 +78,4 @@ def read_file(
             f"profile, or insufficient permissions."
         )
 
-    if not candidate.exists():
-        return f"ERROR: File not found: `{candidate}`"
-
-    try:
-        content = candidate.read_text(encoding="utf-8", errors="replace")
-    except Exception as exc:
-        return f"ERROR: Failed to read `{candidate}`: {exc}"
-
-    total = len(content)
-    truncated = total > _MAX_CHARS
-    body = content[:_MAX_CHARS] if truncated else content
-    header = (
-        f"FILE: {candidate}\n"
-        f"SIZE: {total} chars\n"
-        + (f"NOTE: Truncated at {_MAX_CHARS} chars.\n" if truncated else "")
-        + (f"MODE: SELF-HEALING (project root only)\n" if self_healing else "")
-    )
-    return f"{header}\n```\n{body}\n```"
+    return read_file_action(str(candidate), allowed_roots=(str(PROJECT_ROOT),))

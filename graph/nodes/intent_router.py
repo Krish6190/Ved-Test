@@ -33,13 +33,18 @@ _LENGTH_SPEC_RE = re.compile(
     r"\b\d+\s+(word|words|paragraph|paragraphs|page|pages|line|lines|"
     r"char|chars|character|characters)\b"
 )
+# Narrowed: only clear prose verbs. create/make/build/generate were removed
+# because they commonly mean code/tool work, not prose drafting.
 _GENERATION_VERB_RE = re.compile(
-    r"^(write|draft|compose|generate|create|make|build|craft|author|produce)\s+"
+    r"^(write|draft|compose|author)\s+"
 )
+# Narrowed: dropped write*/draft*/compose* generic prefixes (too broad),
+# dropped summary/summarize (those need file-read tools — Path A handles),
+# added poem/speech as clearly-prose signals.
 _GENERATION_PHRASES = (
-    "write me", "write a", "write an", "draft a", "draft an",
-    "compose a", "essay on", "essay about", "blog post",
-    "story about", "letter to", "report on", "summary of", "summarize",
+    "essay on", "essay about", "blog post",
+    "story about", "letter to", "report on",
+    "poem about", "speech about",
 )
 
 # Explicit user override. Only A and B are valid now; C falls back to A.
@@ -53,9 +58,10 @@ def intent_router_node(state: VedState, get_llm) -> dict:
 
       1. Self-healing phrases     -> A + self_healing=True (flag only, not a route)
       2. Explicit "use path A|B"   -> that path (C overrides fall back to A)
-      3. Word-count spec           -> B ("5 paragraphs", "200 words")
+      3. Word-count spec + prose signal -> B ("write 5 paragraphs", "200 word essay")
       4. Generation verb at start  -> B ("write a poem", "draft an email")
       5. Generation phrase         -> B ("essay on...", "blog post about...")
+      (Length spec alone, or create/make/build/summarize, fall through to A.)
       6. Slash command "/..."      -> A (commands handled by command_processor
                                          before reaching the router in practice;
                                          this is a defensive fallback)
@@ -77,11 +83,17 @@ def intent_router_node(state: VedState, get_llm) -> dict:
         }
 
     # 3-5. Content-generation signals -> Path B (the multi-pass draft pipeline).
-    if _LENGTH_SPEC_RE.search(lower_text):
+    # Length spec alone is too broad (any "5 paragraphs" hit B even with
+    # non-prose verbs). Require the length spec to be paired with a prose
+    # verb OR a content-gen phrase; otherwise fall through to Path A.
+    has_length_spec = bool(_LENGTH_SPEC_RE.search(lower_text))
+    has_prose_verb = bool(_GENERATION_VERB_RE.match(lower_text))
+    has_content_phrase = any(p in lower_text for p in _GENERATION_PHRASES)
+    if has_length_spec and (has_prose_verb or has_content_phrase):
         return {"route_intent": "B", "self_healing": self_healing}
-    if _GENERATION_VERB_RE.match(lower_text):
+    if has_prose_verb:
         return {"route_intent": "B", "self_healing": self_healing}
-    if any(p in lower_text for p in _GENERATION_PHRASES):
+    if has_content_phrase:
         return {"route_intent": "B", "self_healing": self_healing}
 
     # 6. Slash commands route to A as a fallback. (command_processor.py

@@ -8,6 +8,26 @@ from __init__ import MODES
 class ChatbotCommandProcessor:
     def handle_command(self, message: str) -> str | None:
         cmd = message.strip().lower()
+        raw = message.strip()
+
+        # Intercept cd commands BEFORE slash commands so paths with spaces
+        # work (e.g. "cd /Users/me/My Projects"). Uses cmd (lowercased)
+        # for keyword detection but raw for the path itself (case-sensitive
+        # on Linux/macOS).
+        is_cd = (
+            cmd == "cd"
+            or cmd.startswith("cd ")
+            or cmd.startswith("cd\t")
+            or cmd == "/cd"
+            or cmd.startswith("/cd ")
+            or cmd.startswith("/cd\t")
+        )
+        if is_cd:
+            target = raw.lstrip("/").strip()
+            if target.lower().startswith("cd"):
+                target = target[2:].strip()
+            return self._handle_cd(target)
+
         if cmd == "/activate coder":
             try:
                 self.set_mode("coder")
@@ -47,10 +67,67 @@ class ChatbotCommandProcessor:
                 return f"Mode set to {parts[1]}."
             return f"Usage: /mode [{'|'.join(MODES)}]"
 
+        if cmd == "/reindex":
+            # Reset the index flag and kick off a fresh background index.
+            # Useful after manual file changes outside the app, or to force
+            # a re-index after a cd (though cd already resets the flag).
+            self._project_index_started = False
+            if hasattr(self, "on_session_start"):
+                try:
+                    self.on_session_start()
+                    return "Re-indexing project in background. Watch the title-bar chip for status."
+                except Exception as e:
+                    return f"Re-index failed: {type(e).__name__}: {e}"
+            return "Re-index not available (chatbot has no on_session_start method)."
+
         mem_resp = self._handle_memory_commands(cmd)
         if mem_resp is not None:
             return mem_resp
         return self._handle_thread_commands(message)
+
+    def _handle_cd(self, target: str) -> str:
+        """Resolve target path and change cwd. Returns confirmation or error.
+
+        Handles:
+          - "" or "~"  → home directory
+          - "~user"    → that user's home (via expanduser)
+          - ".."       → parent directory
+          - absolute   → used as-is
+          - relative   → resolved against current cwd
+
+        After successful chdir, triggers UI refresh + project re-index so
+        the cwd chip, project indexer, and any open tools see the new
+        directory. Errors return a human-readable string (no exception).
+        """
+        if not target or target == "~":
+            target = os.path.expanduser("~")
+        else:
+            target = os.path.expanduser(target)
+        try:
+            abs_path = os.path.abspath(target)
+            if not os.path.isdir(abs_path):
+                return f"cd: no such directory: {target}"
+            os.chdir(abs_path)
+        except Exception as e:
+            return f"cd failed: {type(e).__name__}: {e}"
+        new_cwd = os.getcwd()
+        # Side effects: update UI + re-index project for new directory.
+        # Both are best-effort; failures here shouldn't block the cd.
+        try:
+            ui = getattr(self, "_ui_components", None)
+            if ui is not None and hasattr(ui, "set_current_directory"):
+                ui.set_current_directory(new_cwd)
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "on_session_start"):
+                # Mark the index as needing refresh; the next chat will trigger
+                # a full re-index. Setting the flag is cheaper than spawning
+                # a thread here (the user might type more cd commands).
+                self._project_index_started = False
+        except Exception:
+            pass
+        return f"Changed directory to {new_cwd}"
 
     def _handle_memory_commands(self, cmd: str) -> str | None:
         # All pin/unpin/list commands operate on the CURRENT thread's

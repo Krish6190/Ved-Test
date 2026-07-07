@@ -2,7 +2,11 @@
 __pycache__/
 *.pyc
 .env
-voice/assets
+# Heavy Piper TTS voice models (~60 MB each). Users download these themselves
+# — see README "Audio files — what they are and how to get them".
+voice/assets/*.onnx
+voice/assets/*.onnx.json
 .kimchi
 data/
 tests/
+.cursor/

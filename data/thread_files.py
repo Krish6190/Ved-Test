@@ -70,21 +70,24 @@ class ThreadFileStore:
         """Return upload metadata sorted by uploaded_at ASC (oldest first)."""
         return sorted(self._load_meta(thread_id), key=lambda e: e.get("uploaded_at", 0))
 
-    def add(self, thread_id: str, source_path: str) -> Dict:
+    def add(self, thread_id: str, source_path: str, filename: str | None = None, chunker: str = "text") -> Dict:
         """Read file, embed chunks into vector DB (scope=thread_id), track chunk count.
 
         No file bytes are persisted. Raises FileNotFoundError if source_path missing;
         bubbles embedding errors after attempting to roll back the registry addition
         (caller may also catch and surface).
+
+        `chunker` selects the chunking strategy: "text" (default) for the
+        document-parser pipeline, "ast" for graph.rag.code_chunker.
         """
         if not source_path or not os.path.isfile(source_path):
             raise FileNotFoundError(f"Source file not found: {source_path}")
 
-        filename = os.path.basename(source_path)
+        filename = filename or os.path.basename(source_path)
         chunks_before = self._count_chunks_in_registry(thread_id)
 
         try:
-            self.rag_db.ingest_local_file(source_path, scope=thread_id)
+            self.rag_db.ingest_local_file(source_path, scope=thread_id, chunker=chunker, source=filename)
         except Exception:
             # Try to roll back any partial registry additions.
             chunks_after_fail = self._count_chunks_in_registry(thread_id)
@@ -111,7 +114,7 @@ class ThreadFileStore:
         entry["evicted"] = [e["filename"] for e in evicted]
         return entry
 
-    def add_text(self, thread_id: str, text: str, source_label: str) -> Dict:
+    def add_text(self, thread_id: str, text: str, source_label: str = "", chunker: str = "text") -> Dict:
         """Embed raw text into the vector DB (scope=thread_id), track chunk count, enforce quota.
 
         No file bytes are persisted. source_label is used to attribute the chunks so
@@ -127,28 +130,28 @@ class ThreadFileStore:
         if not source_label or not source_label.strip():
             raise ValueError("source_label is empty")
 
-        from graph.rag.rag_network import fetch_ollama_vector
-
         chunks_before = self._count_chunks_in_registry(thread_id)
 
         try:
-            chunks = self.rag_db.file_parser.text_splitter.split_raw_text(text)
-            new_nodes = 0
-            existing_entries = {r["content"] for r in self.rag_db.registry}
-            for chunk in chunks:
-                clean = chunk.strip()
-                if not clean or clean in existing_entries:
-                    continue
-                vec = fetch_ollama_vector(clean)
-                if vec:
-                    self.rag_db.registry.append({
-                        "content": clean,
-                        "source": source_label,
-                        "scope": thread_id,
-                        "embedding": vec,
-                    })
-                    new_nodes += 1
-            if new_nodes > 0:
+            if hasattr(self.rag_db, "ingest_text"):
+                self.rag_db.ingest_text(text, scope=thread_id, source=source_label, chunker=chunker)
+            else:
+                # Legacy fallback: chunk + embed manually using the rag_network helper.
+                from graph.rag.rag_network import fetch_ollama_vector
+                chunks = self.rag_db.file_parser.text_splitter.split_raw_text(text)
+                existing_entries = {r["content"] for r in self.rag_db.registry}
+                for chunk in chunks:
+                    clean = chunk.strip()
+                    if not clean or clean in existing_entries:
+                        continue
+                    vec = fetch_ollama_vector(clean)
+                    if vec:
+                        self.rag_db.registry.append({
+                            "content": clean,
+                            "source": source_label,
+                            "scope": thread_id,
+                            "embedding": vec,
+                        })
                 self.rag_db._save_database()
         except Exception:
             # Rollback partial additions

@@ -48,7 +48,9 @@ class VedRagWorker(VedGuiRenderEngine):
             if is_raw_file:
                 if thread_id and self.chatbot and getattr(self.chatbot, "_thread_files", None):
                     # Per-thread quota tracking + LRU eviction.
-                    entry = self.chatbot._thread_files.add(thread_id, data_payload)
+                    filename = os.path.basename(data_payload)
+                    chunker = self.chatbot._rag_chunker() if self.chatbot else "text"
+                    entry = self.chatbot._thread_files.add(thread_id, data_payload, filename=filename, chunker=chunker)
                     evicted = entry.pop("evicted", [])
                     print(f"[Ingest] {entry['filename']}: +{entry['chunk_count']} chunks (thread {thread_id[:8]})", flush=True)
                     if evicted:
@@ -56,7 +58,7 @@ class VedRagWorker(VedGuiRenderEngine):
                     return entry["chunk_count"], None
                 # No active thread — fall back to direct RAG ingest with global scope.
                 old_count = len(rag_db.registry)
-                rag_db.ingest_local_file(data_payload, scope=GLOBAL_SCOPE)
+                rag_db.ingest_local_file(data_payload, scope=GLOBAL_SCOPE, chunker="text", source=os.path.basename(data_payload))
                 added = len(rag_db.registry) - old_count
                 print(f"[Ingest] {os.path.basename(data_payload)}: +{added} chunks (no thread, scope=global)", flush=True)
                 return added, None

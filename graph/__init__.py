@@ -4,6 +4,7 @@ from langchain_core.messages import AIMessage
 
 from .state import VedState
 from .nodes import intent_router_node, chat_node, coder_chat_node
+from .nodes.standalone_chat import standalone_chat_node
 from .nodes.planner import planner_node
 from .nodes.executor import executor_node
 from .content_generation.pipeline_node import content_pipeline_node
@@ -41,9 +42,30 @@ def _route_after_planner(state: VedState) -> str:
     return END
 
 
+def _route_after_intent(state: VedState) -> str:
+    """Conditional edge after `intent_router_node`.
+
+    Routes Path A differently based on mode:
+      - non-coder Path A → standalone_chat_node (simple chatbot with bound
+        tools; no planner-executor split). Used for 8B/14B models that can
+        handle tool use directly.
+      - coder Path A → planner_node (full planner+executor flow for the
+        structured 7B+3B split).
+
+    Path B (content generation) is unchanged.
+    """
+    intent = getattr(state, "route_intent", "")
+    if intent == "A":
+        return "standalone_chat_node" if state.mode != "coder" else "planner_node"
+    if intent == "B":
+        return "content_pipeline_node"
+    return END
+
+
 def build_graph(get_llm):
     g = StateGraph(VedState)
     g.add_node("intent_router_node", lambda state, config: intent_router_node(state, get_llm))
+    g.add_node("standalone_chat_node", lambda state, config: standalone_chat_node(state, get_llm, config))
     g.add_node("planner_node", lambda state, config: planner_node(state, get_llm, config))
     g.add_node("executor_node", lambda state, config: executor_node(state, get_llm, config))
     g.add_node("chat_node", lambda state, config: chat_node(state, get_llm, config))
@@ -54,13 +76,25 @@ def build_graph(get_llm):
 
     g.add_conditional_edges(
         START,
-        lambda state: "coder_chat_node" if state.mode == "coder" else "intent_router_node"
+        lambda state: "planner_node" if state.mode == "coder" else "intent_router_node"
     )
+    # Route Path A based on mode: non-coder skips the planner, coder keeps it.
     g.add_conditional_edges(
         "intent_router_node",
-        lambda state: state.route_intent,
-        {"A": "planner_node", "B": "content_pipeline_node"},
+        _route_after_intent,
+        {
+            "standalone_chat_node": "standalone_chat_node",
+            "planner_node": "planner_node",
+            "content_pipeline_node": "content_pipeline_node",
+            END: END,
+        },
     )
+    # standalone_chat_node is terminal — it returns the final response directly.
+    g.add_edge("standalone_chat_node", END)
+    # coder_chat_node is kept for backwards compatibility but is no longer
+    # in the active routing path (all modes now go through intent_router,
+    # which sends coder Path A → planner → executor loop). Left in the
+    # graph in case future code wants to invoke it directly.
 
     # Planner decides: send to executor (plan), or end (direct/finalize).
     g.add_conditional_edges(

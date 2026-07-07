@@ -1,26 +1,27 @@
 """File editing tools for Ved.
 
 LangChain `@tool`-formatted. Two tools here:
-  - `edit_file(path, old_text, new_text)` — in-place replace with backup + popup.
-  - `overwrite_file(path, content)` — full-file overwrite with backup + popup.
+  - `edit_file(path, old_text, new_text)` - in-place replace with backup + popup.
+  - `overwrite_file(path, content)` - full-file overwrite with backup + popup.
 
 Both follow the project's dual-mode safety policy and accept OPTIONAL
-`path` arguments — if the LLM omits `path`, the tool infers it from the
+`path` arguments - if the LLM omits `path`, the tool infers it from the
 last user message via `resolve_implicit_target`.
 
 Self-healing mode (`state.self_healing=True`) restricts edits to the
 project root; default mode allows any user-accessible file but blocks
 system paths and other users' profiles.
+
+The actual write is delegated to `edit_file_action` / `overwrite_file_action`
+in graph/actions/.
 """
-import shutil
-import tkinter as tk
 from pathlib import Path
-from tkinter import messagebox
 from typing import Annotated
 
 from langchain_core.tools import tool
 from langgraph.prebuilt import InjectedState
 
+from graph.actions.filesystem import edit_file_action, overwrite_file_action
 from graph.state import VedState
 from graph.tools._common import (
     PROJECT_ROOT,
@@ -30,6 +31,15 @@ from graph.tools._common import (
 )
 
 def _request_approval(path: Path, old: str, new: str, self_healing: bool, overwrite: bool) -> bool:
+    # tkinter is imported lazily so this module can be imported (e.g. during
+    # `pytest --collect-only`) in environments where tkinter is unavailable
+    # (headless Linux CI, slim venvs, etc.). The popup is the only consumer
+    # of tkinter, so deferring the import keeps the import surface clean.
+    try:
+        import tkinter as tk
+        from tkinter import messagebox
+    except Exception:
+        return False  # no GUI available -> secure fallback: deny
     try:
         root = tk.Tk()
         root.withdraw()
@@ -85,26 +95,6 @@ def _resolve_and_check(path_str: str, self_healing: bool) -> tuple[Path | None, 
     return resolved, None
 
 
-def _backup_and_write(resolved: Path, new_contents: str) -> str | None:
-    """Write `new_contents` to `resolved` after backing up the existing file.
-    Returns an error string on failure, or None on success."""
-    backup_path = resolved.with_suffix(resolved.suffix + ".bak")
-    try:
-        if resolved.exists() and resolved.is_file():
-            current = resolved.read_text(encoding="utf-8", errors="replace")
-            if current:
-                shutil.copyfile(resolved, backup_path)
-    except Exception as exc:
-        return f"ERROR: Backup failed at {backup_path}: {exc}. Write aborted."
-
-    try:
-        resolved.parent.mkdir(parents=True, exist_ok=True)
-        resolved.write_text(new_contents, encoding="utf-8")
-    except Exception as exc:
-        return f"ERROR: Failed to write {resolved}: {exc}"
-    return None
-
-
 @tool
 def edit_file(
     path: str = "",
@@ -115,7 +105,7 @@ def edit_file(
     """Replace `old_text` with `new_text` inside the file at `path`.
 
     Shows a tkinter approval popup before writing. The first occurrence of
-    `old_text` is replaced. Both `path` and `old_text` are optional — if
+    `old_text` is replaced. Both `path` and `old_text` are optional - if
     omitted, the tool infers the file from the last user message.
 
     Args:
@@ -149,27 +139,12 @@ def edit_file(
     if not _request_approval(resolved, old_text, new_text, self_healing, overwrite=False):
         return "ERROR: User denied edit authorization."
 
-    try:
-        current = resolved.read_text(encoding="utf-8", errors="replace") if resolved.exists() else ""
-    except Exception as exc:
-        return f"ERROR: Failed to read existing file {resolved}: {exc}"
-
-    idx = current.find(old_text)
-    if idx == -1:
-        return (
-            f"ERROR: Could not locate the original text in {resolved}. "
-            "The file may have changed - re-read it first."
-        )
-
-    new_contents = current[:idx] + new_text + current[idx + len(old_text):]
-    write_err = _backup_and_write(resolved, new_contents)
-    if write_err:
-        return write_err
-
-    bytes_written = len(new_contents.encode("utf-8"))
-    mode_tag = " [SELF-HEALING MODE]" if self_healing else ""
-    return (
-        f"OK: Edited {resolved} ({bytes_written} bytes written){mode_tag}"
+    return edit_file_action(
+        str(resolved),
+        old_text,
+        new_text,
+        allowed_roots=(str(PROJECT_ROOT),),
+        backup_dir=None,
     )
 
 
@@ -207,12 +182,9 @@ def overwrite_file(
     if not _request_approval(resolved, "", content, self_healing, overwrite=True):
         return "ERROR: User denied overwrite authorization."
 
-    write_err = _backup_and_write(resolved, content)
-    if write_err:
-        return write_err
-
-    bytes_written = len(content.encode("utf-8"))
-    mode_tag = " [SELF-HEALING MODE]" if self_healing else ""
-    return (
-        f"OK: Overwrote {resolved} ({bytes_written} bytes written){mode_tag}"
+    return overwrite_file_action(
+        str(resolved),
+        content,
+        allowed_roots=(str(PROJECT_ROOT),),
+        backup_dir=None,
     )

@@ -30,6 +30,7 @@ from langchain_core.runnables import RunnableConfig
 from data import plans as plan_store
 from graph.nodes._helpers import _build_rag_block
 from graph.nodes._hints import _FRESH_QUESTION_HINT
+from graph.nodes.planner_diagnostics import escalate, EscalationAction
 from graph.state import VedState
 from graph.tools.rag_retrieve import retrieve_rag
 
@@ -37,9 +38,9 @@ from graph.tools.rag_retrieve import retrieve_rag
 # ---- Output marker parsing (unchanged) ----
 
 _CREATE_PLAN_RE = re.compile(r"CREATE_PLAN:\s*(\[.*?\])", re.DOTALL)
-_DIRECT_ANSWER_RE = re.compile(r"DIRECT_ANSWER:\s*(.*?)(?=\n(?:CREATE_PLAN|EXECUTE_NEXT|FINAL_SUMMARY|DIRECT_ANSWER|ADD_CHUNK_AFTER|REPLACE_CHUNK|REMOVE_CHUNK):|\Z)", re.DOTALL)
+_DIRECT_ANSWER_RE = re.compile(r"\bDIRECT_ANSWER:\s*(.*?)(?=\n(?:CREATE_PLAN|EXECUTE_NEXT|FINAL_SUMMARY|DIRECT_ANSWER|ADD_CHUNK_AFTER|REPLACE_CHUNK|REMOVE_CHUNK):|\Z)", re.DOTALL)
 _EXECUTE_NEXT_RE = re.compile(r"\bEXECUTE_NEXT\b")
-_FINAL_SUMMARY_RE = re.compile(r"FINAL_SUMMARY:\s*(.*?)(?=\n(?:CREATE_PLAN|EXECUTE_NEXT|FINAL_SUMMARY|DIRECT_ANSWER|ADD_CHUNK_AFTER|REPLACE_CHUNK|REMOVE_CHUNK):|\Z)", re.DOTALL)
+_FINAL_SUMMARY_RE = re.compile(r"\bFINAL_SUMMARY:\s*(.*?)(?=\n(?:CREATE_PLAN|EXECUTE_NEXT|FINAL_SUMMARY|DIRECT_ANSWER|ADD_CHUNK_AFTER|REPLACE_CHUNK|REMOVE_CHUNK):|\Z)", re.DOTALL)
 _ADD_CHUNK_AFTER_RE = re.compile(
     r"ADD_CHUNK_AFTER\s+(\d+)\s*:\s*\n\s*INSTRUCTION\s*:\s*(.*?)(?=\n(?:CREATE_PLAN|EXECUTE_NEXT|FINAL_SUMMARY|DIRECT_ANSWER|ADD_CHUNK_AFTER|REPLACE_CHUNK|REMOVE_CHUNK):|\Z)",
     re.DOTALL,
@@ -53,12 +54,6 @@ _SKIP_CHUNK_RE = re.compile(
     r"SKIP_CHUNK\s+(\d+)(?:\s+REASON\s*:\s*(.*?))?(?=\n(?:CREATE_PLAN|EXECUTE_NEXT|FINAL_SUMMARY|DIRECT_ANSWER|ADD_CHUNK_AFTER|REPLACE_CHUNK|REMOVE_CHUNK|SKIP_CHUNK|RECOMMEND_CODER):|\Z)",
     re.DOTALL,
 )
-_RECOMMEND_CODER_RE = re.compile(
-    r"RECOMMEND_CODER_MODE(?:\s+REASON\s*:\s*(.*?))?(?=\n(?:CREATE_PLAN|EXECUTE_NEXT|FINAL_SUMMARY|DIRECT_ANSWER|ADD_CHUNK_AFTER|REPLACE_CHUNK|REMOVE_CHUNK|SKIP_CHUNK|RECOMMEND_CODER):|\Z)",
-    re.DOTALL,
-)
-
-
 def parse_planner_output(text: str) -> Tuple[str, Any]:
     """Parse planner text into (kind, payload).
 
@@ -85,15 +80,9 @@ def parse_planner_output(text: str) -> Tuple[str, Any]:
                 return "create_plan", chunks
         except Exception:
             pass
-    # Check RECOMMEND_CODER_MODE before DIRECT_ANSWER — if the planner
-    # emits both, RECOMMEND_CODER wins because it's the more specific
-    # 'ask the user to switch modes' response. The downstream DIRECT_ANSWER
-    # would otherwise be picked up by its regex even though RECOMMEND_CODER
-    # appears first in the text.
-    m = _RECOMMEND_CODER_RE.search(text)
-    if m:
-        reason = (m.group(1) or "").strip()
-        return "recommend_coder", reason
+    # NOTE: RECOMMEND_CODER_MODE has been removed from the planner entirely.
+    # Path A can now run execute_python natively, so the planner always
+    # proceeds to CREATE_PLAN or DIRECT_ANSWER — no safety recommendation.
     m = _DIRECT_ANSWER_RE.search(text)
     if m:
         answer = m.group(1).strip()
@@ -181,23 +170,6 @@ _PLANNER_SYSTEM = SystemMessage(content=(
     "    is broken in a way downstream chunks don't depend on. The\n"
     "    executor moves on to the next pending chunk.\n"
     "\n"
-    "  RECOMMEND_CODER_MODE REASON: <text>\n"
-    "    Emit this when in standard mode and the task requires coding\n"
-    "    (file edits, script execution, tool design). Standard mode's\n"
-    "    executor only has read-only tools — emit this to ask the user\n"
-    "    to switch to coder mode instead of attempting the task.\n"
-    "\n"
-    "WHEN TO EMIT RECOMMEND_CODER_MODE (important):\n"
-    "  - The task asks to EDIT, MODIFY, UPDATE, FIX, REFACTOR, WRITE, or\n"
-    "    CREATE a file.\n"
-    "  - The task asks to RUN a script or execute code.\n"
-    "  - The task asks to CREATE a new persistent tool.\n"
-    "  In all these cases, standard mode's executor CANNOT do the work\n"
-    "  (no edit_file, no execute_python, no propose_tool). Emit\n"
-    "  RECOMMEND_CODER_MODE with a short reason. Do NOT emit\n"
-    "  DIRECT_ANSWER with instructions for the user to follow manually —\n"
-    "  that just tells the user to do the work themselves.\n"
-    "\n"
     "FAILURE TRIAGE (important):\n"
     "  When a chunk fails, decide between:\n"
     "  - REPLACE_CHUNK: the executor made a mistake (wrong path, wrong args).\n"
@@ -226,21 +198,68 @@ _PLANNER_SYSTEM = SystemMessage(content=(
        "greetings, factual lookups, opinions, explanations of general\n"
        "knowledge. If the user is asking 'how' or 'why' about a concept,\n"
        "that's DIRECT_ANSWER. If they're asking 'do X to Y', that's a plan.\n"
-       "  - In standard mode, if the task needs file editing or code execution,\n"
-       "emit RECOMMEND_CODER_MODE instead of CREATE_PLAN (the executor\n"
-       "can't actually do the work in standard mode).\n"
        "  - When in doubt, prefer CREATE_PLAN over DIRECT_ANSWER. The plan\n"
        "can be one chunk if it's truly simple; DIRECT_ANSWER skips the\n"
        "executor entirely so the user gets no tool support at all.\n"
-       "  - retrieve_rag is for PAST CHAT (prior AI responses, files\n"
-       "uploaded to the thread). It does NOT contain files on disk\n"
-       "unless they were uploaded. Use it for past-chat references\n"
-       "('as we discussed', 'what did you tell me about X'). An empty\n"
-       "result means 'no record' — only then is DIRECT_ANSWER right for\n"
-       "those queries. But 'read the X file', 'find the Y folder',\n"
-       "'open Z': those are TOOL tasks — the executor has read_file +\n"
-       "search_files. Emit CREATE_PLAN, regardless of whether\n"
-       "retrieve_rag returned anything.\n"
+       "  - EXECUTOR TOOLS (what the executor can actually do for you):\n"
+       "      Path A (standard/turbo) executor: read_file, search_files,\n"
+       "        retrieve_rag, open_app. READ-ONLY.\n"
+       "      Coder executor (full set): read_file, edit_file, overwrite_file,\n"
+       "        search_files, execute_python, propose_tool, retrieve_rag, open_app.\n"
+       "      When you CREATE_PLAN, write chunk instructions assuming the\n"
+       "      executor's tools above are available. The executor picks the\n"
+       "      right set automatically based on the active mode.\n"
+       "  - DECISION TREE — classify the request BEFORE calling retrieve_rag:\n"
+       "      User mentions a SPECIFIC file ('read foo.py', 'edit bar.py'):\n"
+       "        straight to read_file/edit_file chunk. No retrieve_rag needed.\n"
+       "      User mentions a SPECIFIC directory ('check voice/', 'look in\n"
+       "        api/'): retrieve_rag(query, paths=['voice/']) chunk first.\n"
+       "        If hits, optionally follow with read_file on the strongest hit.\n"
+       "      User asks about the project GENERICALLY ('check the project',\n"
+       "        'review the code', 'what does this codebase do'):\n"
+       "        retrieve_rag(query) with no paths filter — pulls across the\n"
+       "        whole indexed codebase. Use hits to decide which file(s) to\n"
+       "        read_file next.\n"
+       "      Past-chat references ('as we discussed', 'the answer from\n"
+       "        earlier'): retrieve_rag(query, scope=thread) — same as before.\n"
+       "  - RETRIEVE_RAG — TWO USES (previously these were split; now unified):\n"
+       "      PAST CHAT ('what did you tell me about X', 'recall the auth\n"
+       "        discussion from earlier'): retrieve_rag(query). Returns\n"
+       "        compressed AI responses + uploaded files for the active thread.\n"
+       "      ON-DISK CODE ('find the voice tuner', 'where is auth handled',\n"
+       "        'which file uses OpenAI', 'what's in the planner'):\n"
+       "        retrieve_rag(query, paths=['voice/']) — searches the project\n"
+       "        indexer scope for chunks of source code in the relevant folder.\n"
+       "        Use this BEFORE read_file when you're exploring a codebase you\n"
+       "        haven't been pointed at a specific file in. Empty result =\n"
+       "        'not in scope' -> fall back to search_files.\n"
+       "      COMBINED: a request like 'find the auth code we discussed last\n"
+       "        week' -> first retrieve_rag(query='auth', scope=thread) for past\n"
+       "        chat; if that surfaces a filename, then retrieve_rag(query='auth',\n"
+       "        paths=['src/']) for the code; then read_file on the hit.\n"
+       "  - LOCAL FILE OR COMPONENT QUERIES — STRICT RULE (important):\n"
+       "      NEVER call web_search for files in this project. web_search is for\n"
+       "      external/upstream info the user explicitly asks about (e.g. 'latest\n"
+       "      Python docs', 'OpenRouter pricing'). For local files use search_files\n"
+       "      (filesystem glob) or retrieve_rag (RAG store). If you're not sure\n"
+       "      whether something is local, assume local and use search_files first.\n"
+       "      web_search is NOT in your tool registry — if you think you need it,\n"
+       "      tell the user you can't access the web rather than fabricating a\n"
+       "      web_search tool call.\n"
+       "\n"
+       "  - SELECTIVE INDEXING — decide whether to scope the RAG query:\n"
+       "      GENERIC ('check what's wrong', 'fix this', 'review the code',\n"
+       "        'what changed', 'look at everything'): no path filter. Call\n"
+       "        retrieve_rag(query) — returns matches across the whole project.\n"
+       "      SPECIFIC ('fix voice in voice folder', 'look at src/main.py',\n"
+       "        'what's in the api/ directory', 'check the tests'): scope the\n"
+       "        query to that path. Either:\n"
+       "        a) retrieve_rag(query, paths=['voice/']) — fast, narrow result\n"
+       "        b) Add a search_files chunk first, then read_file on matches.\n"
+       "      If unsure, start generic. You can re-query with paths if the\n"
+       "      generic result is too noisy or off-target.\n"
+       "      The project indexer has already chunked everything in cwd. The\n"
+       "      paths filter is a query-time concern — you don't need to re-index.\n"
 ))
 
 
@@ -408,13 +427,17 @@ def _stream_with_tool_loop(llm, msgs, config, token_queue, max_rounds=_MAX_PLANN
     """Run an LLM stream with a small tool-call loop.
 
     Yields text tokens to token_queue as they arrive. Returns
-    (final_ai_msg, tool_messages) when done. Memoizes retrieve_rag results
-    in `call_cache` so duplicate queries within one planner turn aren't
-    re-embedded + re-searched.
+    (final_ai_msg, tool_messages, last_rag_results) when done. Memoizes
+    retrieve_rag results in `call_cache` so duplicate queries within one
+    planner turn aren't re-embedded + re-searched. `last_rag_results` is a
+    list of formatted result strings from every retrieve_rag call executed
+    during this turn — the planner node attaches these to each new chunk
+    as `context_blocks` so the executor can surface them as background.
     """
     import json as _json
     tool_messages: List[ToolMessage] = []
     call_cache: Dict[str, str] = {}
+    last_rag_results: List[str] = []
     for round_idx in range(max_rounds + 1):
         full_content = ""
         tool_calls_acc: Dict[int, Dict] = {}
@@ -449,12 +472,12 @@ def _stream_with_tool_loop(llm, msgs, config, token_queue, max_rounds=_MAX_PLANN
         ai_msg = AIMessage(content=full_content, tool_calls=tool_calls_list)
 
         if not tool_calls_list:
-            return ai_msg, tool_messages
+            return ai_msg, tool_messages, last_rag_results
 
         if round_idx >= max_rounds:
             # Hit tool-call budget. Return whatever the LLM said plus
             # any tool messages accumulated so far.
-            return ai_msg, tool_messages
+            return ai_msg, tool_messages, last_rag_results
 
         # Execute each tool call, collect results, and re-invoke.
         # call_cache memoizes retrieve_rag results within this planner turn.
@@ -464,10 +487,16 @@ def _stream_with_tool_loop(llm, msgs, config, token_queue, max_rounds=_MAX_PLANN
                 content=result_content,
                 tool_call_id=tc["id"],
             ))
+            # Capture retrieve_rag results so the planner node can attach
+            # them to each chunk as `context_blocks` (surfaced by the
+            # executor as background context). Skip ERROR results so a
+            # broken RAG call doesn't poison the prompt with error text.
+            if tc.get("name") == "retrieve_rag" and not result_content.startswith("ERROR"):
+                last_rag_results.append(result_content)
         # Loop again with the tool messages appended.
         msgs = list(msgs) + [ai_msg] + tool_messages
 
-    return ai_msg, tool_messages  # unreachable but satisfies the type checker
+    return ai_msg, tool_messages, last_rag_results  # unreachable but satisfies the type checker
 
 
 # ---- Node ----
@@ -497,7 +526,48 @@ def planner_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
                         plan_id = pid
                         break
 
-    llm = get_llm()
+    # Phase 4 escalation check: if any chunk has retry_count >= 4, halt
+    # the plan immediately without calling the LLM. Prevents infinite
+    # retry loops when a chunk's tool is broken or the task is genuinely
+    # impossible. Phases 1-3 are still handled by the normal LLM-driven
+    # flow (the planner sees the retry_count in the progress listing and
+    # emits REPLACE_CHUNK / SKIP_CHUNK accordingly).
+    if plan is not None:
+        for c in plan.get("chunks", []):
+            if c.get("retry_count", 0) >= 4:
+                decision = escalate(c["retry_count"], c.get("output", ""), plan)
+                if decision.action == EscalationAction.HARD_HALT_USER_INTERVENTION:
+                    plan_store.abort(plan, decision.halt_message)
+                    plan_store.save_plan(plan)
+                    try:
+                        tq = config["configurable"]["token_queue"]
+                        tq.put(("plan_update", {
+                            "event": "plan_halted",
+                            "reason": decision.reason,
+                            "chunk_id": c["id"],
+                        }))
+                    except (KeyError, TypeError, AttributeError):
+                        pass
+                    return {
+                        "messages": [AIMessage(content=decision.halt_message)],
+                        "route_intent": "A",
+                        "mode": state.mode,
+                        "active_plan_id": None,
+                        "chunk_retry_count": 0,
+                    }
+
+    # Resolve the LLM for this planner call. Production (chatbot.py)
+    # injects a mode-aware `planner_llm_factory` closure into
+    # config["configurable"]; tests that don't bother with the factory
+    # fall back to the legacy `get_llm` callable parameter. Either way
+    # the planner gets a ChatOllama bound to the right model.
+    factory = None
+    if config and isinstance(config.get("configurable"), dict):
+        factory = config["configurable"].get("planner_llm_factory")
+    if factory is not None:
+        llm = factory(state.mode)
+    else:
+        llm = get_llm()
     if llm is None:
         return {
             "messages": [AIMessage(content="No local model is available. Start Ollama.")],
@@ -512,7 +582,7 @@ def planner_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
         token_queue = None
 
     msgs_to_stream = _build_planner_prompt(state, plan, config)
-    ai_msg, tool_messages = _stream_with_tool_loop(
+    ai_msg, tool_messages, last_rag_results = _stream_with_tool_loop(
         llm_planner, msgs_to_stream, config, token_queue
     )
 
@@ -546,6 +616,11 @@ def planner_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
         user_msgs = [m for m in state.messages if isinstance(m, HumanMessage)]
         task = user_msgs[-1].content if user_msgs else ""
         new_plan = plan_store.make_blank_plan(task, payload)
+        # Attach any retrieve_rag results from this planner turn to each
+        # new chunk so the executor can surface them as background context.
+        if last_rag_results:
+            for chunk in new_plan["chunks"]:
+                chunk["context_blocks"] = list(last_rag_results)
         first = new_plan["chunks"][0]
         plan_store.mark_executing(new_plan, first["id"])
         plan_store.save_plan(new_plan)
@@ -707,29 +782,6 @@ def planner_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
         # not stored (planner can re-query on the next turn if needed).
         updates["messages"] = [AIMessage(content=payload)]
         updates["active_plan_id"] = None
-
-    elif kind == "recommend_coder":
-        # Planner detected a coding task in standard mode. Don't run the
-        # executor — Path A's tools can't do real coding work. Emit a
-        # user-facing message asking them to switch to coder mode.
-        reason = payload or "this task needs code execution or file editing."
-        msg_text = (
-            f"This looks like a coding task ({reason}). "
-            "Standard mode has read-only tools and can't run code or edit files. "
-            "Switch to coder mode for full capabilities: `/mode coder`, "
-            "then send your request again."
-        )
-        updates["messages"] = [AIMessage(content=msg_text)]
-        updates["route_intent"] = "A"
-        updates["active_plan_id"] = None
-        if token_queue:
-            try:
-                token_queue.put(("plan_update", {
-                    "event": "recommend_coder",
-                    "reason": reason,
-                }))
-            except Exception:
-                pass
 
     else:  # fallback
         updates["route_intent"] = "A"
