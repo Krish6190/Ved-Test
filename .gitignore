@@ -20,6 +20,7 @@ data/plans/*.json
 data/threads/
 data/vectordb/
 
+
 # Temporary test fixtures generated during pytest runs
 tests/.tmp/
 

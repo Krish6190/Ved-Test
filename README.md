@@ -1,6 +1,6 @@
 # Ved — Local Multi-Format Offline AI Agent
 
-A resource-constrained, fully offline AI agent for Windows/Linux/macOS. Runs inside **4 GB VRAM / 16 GB RAM**, with a Tkinter UI, FastAPI server, offline voice pipeline, per-thread RAG, and a planner-executor coding lane.
+A resource-constrained AI agent for Windows/Linux/macOS. Runs fully offline with local models on **12 GB VRAM / 32 GB RAM**; falls back to **4 GB VRAM / 16 GB RAM** when using OpenRouter/cloud API. Includes a Tkinter UI, FastAPI server, offline voice pipeline, per-thread RAG, and a planner-executor coding lane.
 
 > ⚠️ **Telemetry.** Ved records active-user sessions in `data/telemetry.json` (local only, nothing leaves your network). Sessions are registered on GUI open or `/auth/login`, refreshed by heartbeats, and expire after 5 minutes of inactivity. To disable it entirely, add `VED_TELEMETRY_DISABLED=true` to `.env`. See [Telemetry](#telemetry) below.
 
