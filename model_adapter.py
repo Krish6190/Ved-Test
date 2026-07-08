@@ -72,10 +72,13 @@ class ModelAdapter:
 #
 # Routing:
 #   - get_planner_llm(mode)  -> reads Modelfile.{mode}
-#   - get_executor_llm(mode) -> reads Modelfile.turbo if mode == "coder"
-#                              (the small/fast executor model), else
-#                              reads Modelfile.{mode} (same model for
-#                              both roles in non-coder modes).
+#   - get_executor_llm(mode) -> reads Modelfile.executor (3B) for both
+#                               turbo and coder modes.
+# Mode model mapping:
+#   - standard: 3B CPU (casual chat, no tools)
+#   - turbo:    8B GPU (planner) + 3B executor
+#   - coder:    7B GPU (planner) + 3B executor
+#   - hibernate: no model
 
 
 def _resolve_model_name(mode: str, *, modelfile_dir: str = ".") -> str:
@@ -178,20 +181,18 @@ def get_planner_llm(mode: str, *, base_url: str, device: str, params: dict, mode
 def get_executor_llm(mode: str, *, base_url: str, device: str, params: dict, modelfile_dir: str = "."):
     """Return the LLM the executor node should use for the given mode.
 
-    In coder mode the executor reads Modelfile.turbo (the small/fast
-    3B model) — the planner does the thinking, the executor just runs
-    tool loops. In non-coder modes the executor uses the same Modelfile
-    as the planner (both roles share one model in those modes).
+    The executor always reads Modelfile.executor — a dedicated small/fast
+    model for running tool loops. This keeps it separate from the planner
+    model so the planner (7B in coder mode, 8B in non-coder modes) can
+    focus on reasoning while the executor (3B) focuses on fast tool calls.
 
     `params` can override the model via `params["model"]`.
     """
     p = dict(params) if params else {}
     if "model" in p:
         model = p.pop("model")
-    elif mode == "coder":
-        model = _resolve_model_name("turbo", modelfile_dir=modelfile_dir)
     else:
-        model = _resolve_model_name(mode, modelfile_dir=modelfile_dir)
+        model = _resolve_model_name("executor", modelfile_dir=modelfile_dir)
     return _build_ollama_llm(model, base_url=base_url, device=device, params=p)
 
 

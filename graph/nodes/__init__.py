@@ -3,8 +3,8 @@
 Public surface (re-exported here so `from graph.nodes import X` still works):
 
   - intent_router_node    - heuristic routing (Path A or B)
-  - chat_node             - Path A: chat + RAG + tools
-  - coder_chat_node       - coder mode: coding assistant + tools
+  - standalone_chat_node  - Path A simple: single-agent chat with bound tools
+                            (imported from .standalone_chat)
   - planner_node          - planner role: NO tools, parses CREATE_PLAN / DIRECT_ANSWER / etc.
   - executor_node         - executor role: runs ONE plan chunk with full VED_TOOLS
 
@@ -19,11 +19,10 @@ Helpers (re-exported for test introspection):
 
 Module layout:
 
-  _hints.py      - SystemMessage prompts
-  _helpers.py    - shared streaming / tool-call accounting / cross-mode trigger
+  _hints.py            - SystemMessage prompts
+  _helpers.py          - shared streaming / tool-call accounting / cross-mode trigger
   intent_router.py
-  chat.py
-  coder.py
+  standalone_chat.py
   planner.py
   executor.py
 """
@@ -31,8 +30,6 @@ from __future__ import annotations
 
 # Public node functions (consumed by graph/__init__.py for build_graph).
 from graph.nodes.intent_router import intent_router_node
-from graph.nodes.chat import chat_node
-from graph.nodes.coder import coder_chat_node
 from graph.nodes.planner import planner_node
 from graph.nodes.executor import executor_node
 
@@ -58,8 +55,6 @@ from graph.nodes._helpers import (
 __all__ = [
     # Public nodes
     "intent_router_node",
-    "chat_node",
-    "coder_chat_node",
     "planner_node",
     "executor_node",
     # Hints

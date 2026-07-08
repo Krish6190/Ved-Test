@@ -13,15 +13,28 @@ class LocalVectorDB:
     def __init__(self):
         self.db_path = os.getenv("DB_PATH", "data/vectordb/index.bin")
         self.file_parser = RagDocumentParser()
-        self.embeddings_engine = OllamaEmbeddings(
-            model="nomic-embed-text:latest",
-            base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
-            keep_alive=600
-        )
+        self.embeddings_engine = self._new_embeddings_engine()
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
         self.registry = []
         self.vectors_matrix = None
         self._load_database()
+
+    @staticmethod
+    def _new_embeddings_engine() -> OllamaEmbeddings:
+        return OllamaEmbeddings(
+            model="nomic-embed-text:latest",
+            base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
+            keep_alive=600,
+        )
+
+    def reset_embeddings_engine(self) -> None:
+        """Create a fresh embeddings engine (e.g., after hibernate).
+
+        OllamaEmbeddings is stateless across calls, but creating a fresh
+        instance after a flush ensures any cached state is dropped and the
+        next embed call starts a clean request to Ollama.
+        """
+        self.embeddings_engine = self._new_embeddings_engine()
 
     def _load_database(self):
         if os.path.exists(self.db_path) and os.path.getsize(self.db_path) > 0:

@@ -43,6 +43,12 @@ class VedState(BaseModel):
     web_search_needed: bool = Field(default=False)
     web_search_results: list = Field(default_factory=list)
     self_healing: bool = Field(default=False)
+    # Set by intent_router_node when the user message looks like a
+    # multi-step / complex task (planning/complex-task signals or a long
+    # message that also has a tool-trigger verb). Read by
+    # `_route_after_intent` to decide whether Path A should go through
+    # the planner-executor pipeline or stay on the simple chat node.
+    needs_planning: bool = Field(default=False)
     # Planner-executor pipeline state. Set by planner_node, read by
     # executor_node. Cleared when the plan finalizes or the planner
     # emits DIRECT_ANSWER.

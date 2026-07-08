@@ -359,6 +359,37 @@ class Chatbot(ChatbotCommandProcessor):
         self._llm_cache[self.mode] = llm
         return llm
 
+    def _flush_all_models(self) -> None:
+        """Send `keep_alive: 0` to Ollama for every adapter + embeddings.
+
+        Called when entering hibernate mode so cached models are evicted
+        from Ollama's RAM/VRAM. Best-effort: any single failure is
+        swallowed so one unreachable model doesn't block the rest.
+        """
+        base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+        models_to_flush: set[str] = set()
+
+        for adapter in (self.adapters or {}).values():
+            if adapter is None:
+                continue
+            model_name = getattr(adapter, "model_name", None)
+            if model_name:
+                models_to_flush.add(model_name)
+
+        # The RAG embedding model is loaded independently of the chat
+        # adapters. Flush it too so hibernate truly frees all VRAM.
+        models_to_flush.add("nomic-embed-text:latest")
+
+        for model_name in models_to_flush:
+            try:
+                requests.post(
+                    f"{base_url}/api/generate",
+                    json={"model": model_name, "keep_alive": 0},
+                    timeout=5,
+                )
+            except Exception:
+                pass
+
     def _make_planner_llm_factory(self):
         """Return a closure `f(mode) -> ChatOllama` that the planner node
         will call with `state.mode` to get the right model. Re-resolved
@@ -413,11 +444,24 @@ class Chatbot(ChatbotCommandProcessor):
         self._hibernating = (mode == "hibernate")
         self._llm_cache.clear()
         base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-        prev_adapter = self.adapters.get(old_mode)
-        if prev_adapter and prev_adapter.model_name:
-            try: requests.post(f"{base_url}/api/generate", json={"model": prev_adapter.model_name, "keep_alive": 0}, timeout=5)
-            except Exception: pass
-        if mode != "hibernate":
+
+        if mode == "hibernate":
+            # Entering hibernate: flush every cached model from Ollama.
+            # The existing per-transition flush below is skipped because
+            # _flush_all_models already covers the previous mode.
+            self._flush_all_models()
+        else:
+            # If we are waking up from hibernate, reset the RAG embedding
+            # engine so the next upload/query starts a fresh Ollama request.
+            if old_mode == "hibernate":
+                from graph.rag import rag_db
+                rag_db.reset_embeddings_engine()
+            # Normal mode switch: flush only the previous mode's model,
+            # then keep the new model alive and rebuild the graph.
+            prev_adapter = self.adapters.get(old_mode)
+            if prev_adapter and prev_adapter.model_name:
+                try: requests.post(f"{base_url}/api/generate", json={"model": prev_adapter.model_name, "keep_alive": 0}, timeout=5)
+                except Exception: pass
             self._graph = build_graph(self._get_llm)
             active_adapter = self.adapters.get(mode)
             if active_adapter and active_adapter.model_name:

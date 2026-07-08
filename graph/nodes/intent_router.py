@@ -14,6 +14,7 @@ import re
 from langchain_core.messages import HumanMessage
 
 from graph.state import VedState
+from graph.nodes._helpers import _TOOL_TRIGGER_RE
 
 
 # ---- Pattern tables ----
@@ -27,6 +28,37 @@ _SELF_HEAL_PHRASES = (
     "repair yourself", "repair your code", "repair itself",
     "self repair", "self-repair",
 )
+
+# Planning / complex-task signals. When a Path-A message matches one of
+# these (or is long + tool-triggering), we route through the planner-
+# executor pipeline instead of the simple standalone_chat node. Kept
+# intentionally broad-but-cheap: this is a router, not a planner; the
+# planner will still decide DIRECT_ANSWER vs CREATE_PLAN.
+_PLANNING_SIGNAL_RE = re.compile(
+    r"\b("
+    r"plan|planning|"
+    r"step[- ]by[- ]step|"
+    r"break\s+down|breakdown|"
+    r"implement|"
+    r"build|"
+    r"create\s+a|"
+    r"multiple|"
+    r"project|"
+    r"complex|"
+    r"edit|"
+    r"modify|"
+    r"write\s+code|"
+    r"refactor|"
+    r"several|"
+    r"and\s+then|"
+    r"first\b.*\bthen\b"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Length threshold above which a tool-triggering message is treated as
+# complex and pushed through the planner.
+_PLANNING_LONG_MESSAGE_LEN = 250
 
 # Content-generation triggers. These produce multi-pass drafts (Path B).
 _LENGTH_SPEC_RE = re.compile(
@@ -51,6 +83,33 @@ _GENERATION_PHRASES = (
 _EXPLICIT_PATH_RE = re.compile(r"\b(?:use\s+)?path\s+([ab])\b", re.IGNORECASE)
 
 
+def _compute_needs_planning(last_user_text: str) -> bool:
+    """Return True when a Path-A message looks complex enough to warrant
+    the planner-executor pipeline.
+
+    Triggers:
+      - The message text matches any planning / complex-task signal in
+        `_PLANNING_SIGNAL_RE` (e.g. "implement", "step by step",
+        "build", "refactor", "and then", "first...then").
+      - OR the message is longer than `_PLANNING_LONG_MESSAGE_LEN` chars
+        AND contains a tool-trigger verb (from `_TOOL_TRIGGER_RE`). Long
+        tool-touching requests are nearly always multi-step.
+
+    The planner itself still decides DIRECT_ANSWER vs CREATE_PLAN; this
+    flag only steers Path A toward the planner node vs the simpler
+    standalone_chat node.
+    """
+    lower = last_user_text.lower()
+    if _PLANNING_SIGNAL_RE.search(lower):
+        return True
+    if (
+        len(last_user_text) > _PLANNING_LONG_MESSAGE_LEN
+        and bool(_TOOL_TRIGGER_RE.search(lower))
+    ):
+        return True
+    return False
+
+
 def intent_router_node(state: VedState, get_llm) -> dict:
     """Route to Path A (chat + planner + tools) or Path B (content generation).
 
@@ -66,6 +125,12 @@ def intent_router_node(state: VedState, get_llm) -> dict:
                                          before reaching the router in practice;
                                          this is a defensive fallback)
       7. Default                   -> A (chat / planner / executor handles it)
+
+    For Path-A outcomes in non-coder mode, the returned dict also carries
+    `needs_planning`: True when the message matches a planning signal or
+    is a long tool-triggering request (see `_compute_needs_planning`).
+    `_route_after_intent` uses this to send complex Path-A requests to
+    `planner_node` instead of `standalone_chat_node`.
     """
     user_messages = [m for m in state.messages if isinstance(m, HumanMessage)]
     last_user_text = user_messages[-1].content.strip() if user_messages else ""
@@ -77,10 +142,11 @@ def intent_router_node(state: VedState, get_llm) -> dict:
     # 2. Explicit override. Only A and B valid now; C falls back to A.
     override = _EXPLICIT_PATH_RE.search(lower_text)
     if override:
-        return {
-            "route_intent": override.group(1).upper(),
-            "self_healing": self_healing,
-        }
+        path = override.group(1).upper()
+        result = {"route_intent": path, "self_healing": self_healing}
+        if path == "A" and state.mode != "coder":
+            result["needs_planning"] = _compute_needs_planning(last_user_text)
+        return result
 
     # 3-5. Content-generation signals -> Path B (the multi-pass draft pipeline).
     # Length spec alone is too broad (any "5 paragraphs" hit B even with
@@ -100,8 +166,14 @@ def intent_router_node(state: VedState, get_llm) -> dict:
     # actually handles most slash commands before they reach the graph,
     # so this branch is rarely hit, but it's defensive.)
     if lower_text.startswith("/"):
-        return {"route_intent": "A", "self_healing": self_healing}
+        result = {"route_intent": "A", "self_healing": self_healing}
+        if state.mode != "coder":
+            result["needs_planning"] = _compute_needs_planning(last_user_text)
+        return result
 
     # 7. Default -> A. The planner will decide plan vs direct answer;
     #    the executor will call tools if needed.
-    return {"route_intent": "A", "self_healing": self_healing}
+    result = {"route_intent": "A", "self_healing": self_healing}
+    if state.mode != "coder":
+        result["needs_planning"] = _compute_needs_planning(last_user_text)
+    return result

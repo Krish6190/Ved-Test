@@ -1,32 +1,20 @@
-from langgraph.graph import StateGraph, START, END
-from langgraph.prebuilt import ToolNode
 from langchain_core.messages import AIMessage
+from langgraph.graph import StateGraph, START, END
 
 from .state import VedState
-from .nodes import intent_router_node, chat_node, coder_chat_node
+from .nodes import intent_router_node
 from .nodes.standalone_chat import standalone_chat_node
+from .nodes.simple_chat import simple_chat_node
 from .nodes.planner import planner_node
 from .nodes.executor import executor_node
 from .content_generation.pipeline_node import content_pipeline_node
-from graph.tools import VED_TOOLS
 
 
-def _route_after_llm(state: VedState) -> str:
-    """Conditional edge after `chat_node` / `coder_chat_node` / `executor_node`.
-
-    If the LLM's last message contains `tool_calls`, hand off to the
-    `tools` node (ToolNode) which executes them and returns a ToolMessage.
-    Otherwise end the turn (or loop back to planner for the executor).
-    """
-    last = state.messages[-1] if state.messages else None
-    if isinstance(last, AIMessage) and getattr(last, "tool_calls", None):
-        return "tools"
-    return END
-
-
-def _route_after_tools(state: VedState) -> str:
-    """After ToolNode executes, loop back to the originating LLM node."""
-    return "coder_chat_node" if state.mode == "coder" else "chat_node"
+def hibernate_node(state: VedState, get_llm, config) -> dict:
+    return {
+        "messages": [AIMessage(content="Ved is hibernating. Type /wake to resume.")],
+        "route_intent": state.route_intent, "mode": state.mode,
+    }
 
 
 def _route_after_planner(state: VedState) -> str:
@@ -45,18 +33,26 @@ def _route_after_planner(state: VedState) -> str:
 def _route_after_intent(state: VedState) -> str:
     """Conditional edge after `intent_router_node`.
 
-    Routes Path A differently based on mode:
-      - non-coder Path A → standalone_chat_node (simple chatbot with bound
-        tools; no planner-executor split). Used for 8B/14B models that can
-        handle tool use directly.
-      - coder Path A → planner_node (full planner+executor flow for the
-        structured 7B+3B split).
+    Routes Path A differently based on mode and complexity:
+      - coder Path A                 → planner_node (always; the coder
+        pipeline is built around planner+executor).
+      - non-coder Path A, complex    → planner_node (set when
+        `state.needs_planning` is True; complex multi-step / long
+        tool-triggering requests get the full planner-executor pipeline
+        even on the simpler 8B/14B models).
+      - non-coder Path A, simple     → standalone_chat_node (chatbot with
+        bound tools; no planner-executor split). Used for short, casual
+        requests that don't need a plan.
 
     Path B (content generation) is unchanged.
     """
     intent = getattr(state, "route_intent", "")
     if intent == "A":
-        return "standalone_chat_node" if state.mode != "coder" else "planner_node"
+        if state.mode == "coder":
+            return "planner_node"
+        if getattr(state, "needs_planning", False):
+            return "planner_node"
+        return "standalone_chat_node"
     if intent == "B":
         return "content_pipeline_node"
     return END
@@ -66,17 +62,26 @@ def build_graph(get_llm):
     g = StateGraph(VedState)
     g.add_node("intent_router_node", lambda state, config: intent_router_node(state, get_llm))
     g.add_node("standalone_chat_node", lambda state, config: standalone_chat_node(state, get_llm, config))
+    g.add_node("simple_chat_node", lambda state, config: simple_chat_node(state, get_llm, config))
     g.add_node("planner_node", lambda state, config: planner_node(state, get_llm, config))
     g.add_node("executor_node", lambda state, config: executor_node(state, get_llm, config))
-    g.add_node("chat_node", lambda state, config: chat_node(state, get_llm, config))
     g.add_node("content_pipeline_node", lambda state, config: content_pipeline_node(state, get_llm, config))
-    g.add_node("coder_chat_node", lambda state, config: coder_chat_node(state, get_llm, config))
-    # ToolNode executes any tool_calls emitted by the bound LLM.
-    g.add_node("tools", ToolNode(VED_TOOLS))
+    g.add_node("hibernate_node", lambda state, config: hibernate_node(state, get_llm, config))
 
     g.add_conditional_edges(
         START,
-        lambda state: "planner_node" if state.mode == "coder" else "intent_router_node"
+        lambda state: {
+            "hibernate": "hibernate_node",
+            "standard": "simple_chat_node",
+            "turbo": "intent_router_node",
+            "coder": "planner_node",
+        }.get(state.mode, "simple_chat_node"),
+        {
+            "hibernate_node": "hibernate_node",
+            "simple_chat_node": "simple_chat_node",
+            "intent_router_node": "intent_router_node",
+            "planner_node": "planner_node",
+        },
     )
     # Route Path A based on mode: non-coder skips the planner, coder keeps it.
     g.add_conditional_edges(
@@ -91,10 +96,10 @@ def build_graph(get_llm):
     )
     # standalone_chat_node is terminal — it returns the final response directly.
     g.add_edge("standalone_chat_node", END)
-    # coder_chat_node is kept for backwards compatibility but is no longer
-    # in the active routing path (all modes now go through intent_router,
-    # which sends coder Path A → planner → executor loop). Left in the
-    # graph in case future code wants to invoke it directly.
+    # simple_chat_node (standard mode) is terminal — no tools, no planner.
+    g.add_edge("simple_chat_node", END)
+    # hibernate_node is terminal — no model, no work.
+    g.add_edge("hibernate_node", END)
 
     # Planner decides: send to executor (plan), or end (direct/finalize).
     g.add_conditional_edges(
@@ -107,25 +112,5 @@ def build_graph(get_llm):
     # reads the chunk output + structured tool_calls from the plan file.
     g.add_edge("executor_node", "planner_node")
 
-    # coder_chat_node: LLM emits tool_calls or ends. (No more /run -> C; that
-    # path is gone. /run and "execute ..." now flow through Path A.)
-    g.add_conditional_edges(
-        "coder_chat_node",
-        _route_after_llm,
-        {"tools": "tools", END: END},
-    )
-
-    # chat_node: route to ToolNode if the LLM emitted tool_calls, else END.
-    g.add_conditional_edges(
-        "chat_node",
-        _route_after_llm,
-        {"tools": "tools", END: END}
-    )
-    # ToolNode loops back to the originating LLM.
-    g.add_conditional_edges(
-        "tools",
-        _route_after_tools,
-        {"chat_node": "chat_node", "coder_chat_node": "coder_chat_node"}
-    )
     g.add_edge("content_pipeline_node", END)
     return g.compile()
