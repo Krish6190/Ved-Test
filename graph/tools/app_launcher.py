@@ -13,24 +13,14 @@ bus (`event: approval_request {kind: "app_launch"}`) so the web UI can
 show a modal; in the Tkinter desktop UI it falls back to a yes/no popup.
 """
 from __future__ import annotations
-import os
 import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import messagebox
 from typing import Annotated, Optional
-
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
-
-from graph.actions.apps import (
-    open_app_action,
-    _resolve_candidates,
-    _search_windows,
-    _search_linux_macos,
-    _windows_install_dirs,
-    _windows_start_menu_dirs,
-)
+from graph.actions.apps import open_app_action, _resolve_candidates, _search_windows, _search_linux_macos, _windows_install_dirs, _windows_start_menu_dirs
 
 # Re-exported for back-compat with tests that monkeypatch these names on
 # this module (e.g. tests/test_app_launcher.py).

@@ -30,6 +30,7 @@ from graph.tools._common import (
     is_safe_self_healing,
     resolve_implicit_target,
 )
+from graph.tools.staging_registry import STAGING_REGISTRY
 
 
 @tool
@@ -78,4 +79,13 @@ def read_file(
             f"profile, or insufficient permissions."
         )
 
-    return read_file_action(str(candidate), allowed_roots=(str(PROJECT_ROOT),))
+    raw = read_file_action(str(candidate), allowed_roots=(str(PROJECT_ROOT),))
+
+    # Virtual read overlay: if this file has a pending staged edit in the
+    # active response, present the post-edit content to the model so it
+    # never operates against stale code.
+    thread_id = getattr(state, "active_thread_id", "")
+    if thread_id and STAGING_REGISTRY.has_session(thread_id):
+        raw = STAGING_REGISTRY.get_overlay(thread_id, str(candidate.resolve()), raw)
+
+    return raw

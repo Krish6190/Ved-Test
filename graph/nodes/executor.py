@@ -20,22 +20,135 @@ Difference from the previous design:
     state.messages.
 """
 from __future__ import annotations
-
 import json
 from typing import Any, Dict, List, Tuple
-
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
-
 from data import plans as plan_store
+# DEPRECATED: Kept for legacy fallback compatibility.
+# These actions are no longer invoked from executor.py (file-edit tools
+# now stage via the tool layer / STAGING_REGISTRY), but existing test
+# suites monkeypatch them as attributes of the executor module.
+from graph.actions.filesystem import edit_file_action, overwrite_file_action
 from graph.state import VedState
-from graph.nodes.executor_runtime import ExecutorRuntime
+from graph.nodes._stream_helpers import _stream_text
 from graph.tools import PATH_A_EXECUTOR_TOOLS, VED_TOOLS, _assert_tool_isolation
+from graph.tools.file_editor import overwrite_file, _resolve_and_check
+from graph.tools.file_reader import read_file
+from graph.tools.staging_registry import STAGING_REGISTRY
+
+_PREVIEW_MAX_CHARS = 300
+_FILE_EDIT_TOOLS = frozenset({"edit_file", "overwrite_file"})
 
 
 # Tunables
 _MAX_AGENT_ITERATIONS = 8          # hard cap on LLM <-> tools round-trips per chunk
 _TOOL_RESULT_MAX_CHARS = 1500       # truncate tool output so chunks stay small
+
+# ---- Mode-aware tool notes (reused in executor_prompt) ----
+_TOOLS_NOTE_CODER = (
+    "Available tools (full coder mode): read_file, edit_file, "
+    "overwrite_file, search_files, execute_python, propose_tool, "
+    "open_app, retrieve_rag."
+)
+_TOOLS_NOTE_STANDARD = (
+    "Available tools (standard mode, NO code execution): "
+    "read_file, search_files, retrieve_rag, open_app."
+)
+
+# ---- File editing rules (injected into the executor prompt) ----
+_FILE_EDITING_RULES = (
+    "FILE EDITING RULES (critical):\n"
+    "- PREFER edit_file (FIM-style) over overwrite_file. edit_file replaces\n"
+    "  a specific old_text with new_text and preserves all surrounding\n"
+    "  content untouched.\n"
+    "- NEVER call overwrite_file if the file content shows AST outline markers\n"
+    "  like '... # [AST Body Hidden]'. The outline is a VRAM protection on the\n"
+    "  READ side — the actual file on disk still has the full content. Writing\n"
+    "  the outline back would destroy the file.\n"
+    "- If you only see an outlined version, call read_file FIRST to get the full\n"
+    "  content, THEN call edit_file with the precise old_text/new_text pair.\n"
+    "- For new files, use execute_python to write the content (coder mode) or\n"
+    "  propose_tool to create a persistent helper that does the write.\n"
+    "- edit_file's old_text must match EXACTLY (whitespace and indentation). If\n"
+    "  it doesn't match, read the file again to get the current content."
+)
+
+# ---- Dual-role Executor (Typist) prompt template ----
+
+_EXECUTOR_TYPIST_PROMPT_TEMPLATE = (
+    "Apply this fix instruction to the code snippet. Only make the exact "
+    "change requested. Output only the updated code block. "
+    "Fix: {fix}. Code: {code}"
+)
+
+
+def _build_typist_prompt(fix_instruction: str, code_snippet: str) -> HumanMessage:
+    """Return the exact Executor (Typist) prompt for a fix + code snippet."""
+    return HumanMessage(content=_EXECUTOR_TYPIST_PROMPT_TEMPLATE.format(
+        fix=fix_instruction, code=code_snippet
+    ))
+
+
+def _extract_code_block(text: str) -> str:
+    """Strip markdown fences and return the inner code block if present."""
+    text = text.strip()
+    if text.startswith("```"):
+        # Drop first fence line
+        lines = text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        return "\n".join(lines).strip()
+    return text
+
+
+def _apply_pending_read_overlay(
+    path: str,
+    raw_content: str,
+    pending_tasks: dict,
+    pending_lock,
+) -> str:
+    """Apply the most recent pending edit for `path` on top of `raw_content`.
+
+    Virtual read overlay: if the LLM reads a file it has a pending edit
+    for, we hand back the post-edit content so its next `edit_file`
+    operates against the new state. This is read-only — we never touch
+    disk here.
+
+    For `edit_file` we replace the first occurrence of `old_text` with
+    `new_text`. If `old_text` is not found (because an earlier tool in
+    the chunk already changed the file), we return `raw_content` with a
+    warning marker so the LLM knows the overlay did not apply.
+
+    For `overwrite_file` the entire `content` is returned.
+    """
+    if not pending_tasks or pending_lock is None:
+        return raw_content
+    try:
+        with pending_lock:
+            task = pending_tasks.get(path)
+        if not task:
+            return raw_content
+        tool_name = task.get("tool_name", "")
+        args = task.get("args", {}) or {}
+        if tool_name == "edit_file":
+            old_text = args.get("old_text", "") or ""
+            new_text = args.get("new_text", "") or ""
+            if old_text and old_text in raw_content:
+                return raw_content.replace(old_text, new_text, 1)
+            return raw_content + (
+                "\n\n[VIRTUAL OVERLAY WARNING] Pending edit_file old_text "
+                "no longer matches this file's on-disk content; the virtual "
+                "overlay was not applied. Read the file again or re-issue "
+                "the edit with a matching old_text."
+            )
+        if tool_name == "overwrite_file":
+            return args.get("content", "") or ""
+        return raw_content
+    except Exception:
+        return raw_content
 
 
 def _invoke_tool_sync(tool, args: dict) -> Tuple[str, bool]:
@@ -48,6 +161,23 @@ def _invoke_tool_sync(tool, args: dict) -> Tuple[str, bool]:
         return s, True
     except Exception as exc:
         return f"ERROR: {type(exc).__name__}: {exc}", False
+
+
+def _emit_file_edit_approval_request(token_queue, payload: dict) -> None:
+    """Push a `file_edit_approval_request` event onto the UI's token queue.
+
+    The new multi-file design does NOT block here. The executor adds the
+    pending edit to the shared `file_edit_pending_tasks` dict (keyed by
+    absolute file path) and immediately returns a pending result to the
+    LLM. A daemon worker thread in `chatbot.py` waits on the approval
+    event, applies approved edits, and discards rejected ones.
+    """
+    if token_queue is None:
+        return
+    try:
+        token_queue.put(("file_edit_approval_request", payload))
+    except Exception:
+        pass
 
 
 def _stream_one_iteration(llm_with_tools, messages, token_queue) -> Tuple[str, list]:
@@ -118,6 +248,94 @@ def executor_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
             "route_intent": state.route_intent, "mode": state.mode,
         }
 
+    # ---- Dual-role Executor (Typist) handling ----
+    dual_phase = getattr(state, "dual_role_phase", "")
+    thread_id = getattr(state, "active_thread_id", "")
+
+    if dual_phase == "read_target":
+        # Read the target file so the Planner (Thinker) can analyze it.
+        target_path = getattr(state, "target_file_path", "")
+        if not target_path:
+            return {
+                "messages": [],
+                "route_intent": "P",
+                "mode": state.mode,
+                "dual_role_phase": "",
+            }
+        content = read_file.invoke({"path": target_path}, config=config)
+        return {
+            "messages": [],
+            "route_intent": "P",
+            "mode": state.mode,
+            "dual_role_phase": "analyze",
+            "target_file_content": content,
+        }
+
+    if dual_phase == "execute":
+        # The Planner (Thinker) already produced a fix instruction. Run the
+        # Executor (Typist) prompt to turn it into an updated code block,
+        # then apply it with a file-modification tool (which stages the edit).
+        fix_instruction = getattr(state, "fix_instruction", "")
+        code_snippet = getattr(state, "target_file_content", "")
+        target_path = getattr(state, "target_file_path", "")
+        if not fix_instruction or not code_snippet or not target_path:
+            return {
+                "messages": [],
+                "route_intent": "P",
+                "mode": state.mode,
+                "dual_role_phase": "stage",
+            }
+        factory = None
+        if config and isinstance(config.get("configurable"), dict):
+            factory = config["configurable"].get("executor_llm_factory")
+        llm = factory(state.mode) if factory is not None else get_llm()
+        if llm is None:
+            return {
+                "messages": [AIMessage(content="No local model is available. Start Ollama.")],
+                "route_intent": state.route_intent, "mode": state.mode,
+            }
+        full_content = ""
+        try:
+            full_content = _stream_text(
+                llm,
+                [
+                    SystemMessage(content="You are a precise coding assistant."),
+                    _build_typist_prompt(fix_instruction, code_snippet),
+                ],
+                token_queue,
+            )
+        except Exception as exc:
+            return {
+                "messages": [],
+                "route_intent": "P",
+                "mode": state.mode,
+                "dual_role_phase": "stage",
+                "executor_generated_code": f"ERROR: {type(exc).__name__}: {exc}",
+            }
+        generated_code = _extract_code_block(full_content)
+        # Apply the generated code via overwrite_file so the whole snippet is
+        # replaced. The tool stages the change instead of writing disk.
+        result = overwrite_file.invoke(
+            {"path": target_path, "content": generated_code},
+            config=config,
+        )
+        # Detect staged edits and emit the review event to the UI.
+        if isinstance(result, str) and result.startswith("STAGED:"):
+            tasks = STAGING_REGISTRY.get_tasks(thread_id) if thread_id else {}
+            _emit_file_edit_approval_request(token_queue, {
+                "path": target_path,
+                "operation": "overwrite",
+                "preview": {"old": code_snippet[:_PREVIEW_MAX_CHARS], "new": generated_code[:_PREVIEW_MAX_CHARS]},
+                "tasks": dict(tasks),
+            })
+        return {
+            "messages": [],
+            "route_intent": "P",
+            "mode": state.mode,
+            "dual_role_phase": "stage",
+            "executor_generated_code": generated_code,
+        }
+
     # Resolve the LLM for this executor call. Production (chatbot.py)
     # injects a mode-aware `executor_llm_factory` closure into
     # config["configurable"]; tests that don't bother with the factory
@@ -153,17 +371,7 @@ def executor_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
     tool_map = {t.name: t for t in tools_to_bind}
 
     # Mode-aware tool note for the executor's prompt
-    if state.mode == "coder":
-        tools_note = (
-            "Available tools (full coder mode): read_file, edit_file, "
-            "overwrite_file, search_files, execute_python, propose_tool, "
-            "open_app, retrieve_rag."
-        )
-    else:
-        tools_note = (
-            "Available tools (standard mode, NO code execution): "
-            "read_file, search_files, retrieve_rag, open_app."
-        )
+    tools_note = _TOOLS_NOTE_CODER if state.mode == "coder" else _TOOLS_NOTE_STANDARD
 
     # Initial prompt for chunk N
     total = len(plan.get("chunks", []))
@@ -177,22 +385,7 @@ def executor_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
         f"{tools_note}\n\n"
         "Do this task now. Use the available tools as needed. When done, "
         "give a concise summary of what you did and what you observed.\n\n"
-        "FILE EDITING RULES (critical):\n"
-        "- PREFER edit_file (FIM-style) over overwrite_file. edit_file replaces\n"
-        "  a specific old_text with new_text and preserves all surrounding\n"
-        "  content untouched.\n"
-        "- NEVER call overwrite_file if the file content in your context shows\n"
-        "  AST outline markers like '... # [AST Body Hidden]'. The outline is a\n"
-        "  VRAM protection on the READ side — the actual file on disk still has\n"
-        "  the full content. Writing the outline back would destroy the file.\n"
-        "- If you only see an outlined version of a file, call read_file FIRST\n"
-        "  to get the full content, THEN call edit_file with the precise\n"
-        "  old_text/new_text pair.\n"
-        "- For new files, use execute_python to write the content (in coder mode)\n"
-        "  or propose_tool to create a persistent helper that does the write.\n"
-        "- When using edit_file, the old_text must match EXACTLY (including\n"
-        "  whitespace and indentation). If it doesn't match, read the file\n"
-        "  again to get the current content."
+        f"{_FILE_EDITING_RULES}"
     ))
     # Surface planner-captured context_blocks as read-only background.
     # The "not instructions" wording is intentional: a context block
@@ -212,6 +405,35 @@ def executor_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
         token_queue = config["configurable"]["token_queue"]
     except (KeyError, TypeError):
         token_queue = None
+
+    # File-edit staging: the tool layer (graph.tools.file_editor) handles
+    # registry-based staging when a session is active. For backward
+    # compatibility with callers that wire the legacy in-memory approval
+    # infrastructure directly into config, the executor also intercepts
+    # edit_file / overwrite_file calls and populates the legacy dict.
+    thread_id = getattr(state, "active_thread_id", "")
+
+    # Legacy approval infra (opt-in). When present, intercept file edits
+    # so the existing test suite and direct callers keep working.
+    file_edit_approval_event = None
+    file_edit_approval_state = None
+    file_edit_pending_tasks = None
+    file_edit_pending_lock = None
+    try:
+        configurable = config["configurable"]
+    except (KeyError, TypeError):
+        configurable = None
+    if isinstance(configurable, dict):
+        file_edit_approval_event = configurable.get("file_edit_approval_event")
+        file_edit_approval_state = configurable.get("file_edit_approval_state")
+        file_edit_pending_tasks = configurable.get("file_edit_pending_tasks")
+        file_edit_pending_lock = configurable.get("file_edit_pending_lock")
+    has_approval_infra = (
+        file_edit_approval_event is not None
+        and file_edit_approval_state is not None
+        and isinstance(file_edit_pending_tasks, dict)
+        and file_edit_pending_lock is not None
+    )
 
     # === Agent loop ===
     structured_log: List[Dict[str, Any]] = []
@@ -256,7 +478,105 @@ def executor_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
                 any_error = True
                 break
 
-            result_text, ok = _invoke_tool_sync(tool, tc["args"])
+            # Legacy interception path: when the caller wired the in-memory
+            # approval infrastructure into config, stage the edit directly
+            # without invoking the tool. This preserves the existing unit
+            # tests and direct API callers.
+            if tc["name"] in _FILE_EDIT_TOOLS and has_approval_infra:
+                self_healing = bool(getattr(state, "self_healing", False))
+                path_str = tc["args"].get("path", "") or ""
+                resolved_path = path_str
+                try:
+                    resolved, err = _resolve_and_check(path_str, self_healing)
+                    if resolved is not None:
+                        resolved_path = str(resolved)
+                except Exception:
+                    resolved_path = path_str
+                tool_name = tc["name"]
+                args_copy = dict(tc["args"])
+                if "path" in args_copy:
+                    args_copy["path"] = resolved_path
+                task = {
+                    "tool_name": tool_name,
+                    "path": resolved_path,
+                    "args": args_copy,
+                    "self_healing": self_healing,
+                    "preview": {
+                        "old": (args_copy.get("old_text") or "")[:_PREVIEW_MAX_CHARS],
+                        "new": (
+                            args_copy.get("new_text")
+                            if tool_name == "edit_file"
+                            else args_copy.get("content") or ""
+                        )[:_PREVIEW_MAX_CHARS],
+                    },
+                }
+                with file_edit_pending_lock:
+                    file_edit_pending_tasks[resolved_path] = task
+                payload = {
+                    "path": resolved_path,
+                    "operation": "edit" if tool_name == "edit_file" else "overwrite",
+                    "preview": task["preview"],
+                    "tasks": dict(file_edit_pending_tasks),
+                }
+                _emit_file_edit_approval_request(token_queue, payload)
+                try:
+                    file_edit_approval_state["value"] = None
+                    file_edit_approval_event.set()
+                except Exception:
+                    pass
+                result_text = (
+                    f"Pending approval: {tool_name} on {resolved_path}. "
+                    f"Awaiting user decision in the file-edit review panel."
+                )
+                ok = True
+            elif tc["name"] == "read_file" and has_approval_infra:
+                # Legacy read overlay using the in-memory pending dict.
+                result_text, ok = _invoke_tool_sync(tool, tc["args"])
+                if ok:
+                    try:
+                        path_str = tc["args"].get("path", "") or ""
+                        self_healing = bool(getattr(state, "self_healing", False))
+                        resolved_path = path_str
+                        try:
+                            resolved, err = _resolve_and_check(path_str, self_healing)
+                            if resolved is not None:
+                                resolved_path = str(resolved)
+                        except Exception:
+                            resolved_path = path_str
+                        result_text = _apply_pending_read_overlay(
+                            resolved_path, result_text,
+                            file_edit_pending_tasks,
+                            file_edit_pending_lock,
+                        )
+                    except Exception:
+                        pass
+            else:
+                result_text, ok = _invoke_tool_sync(tool, tc["args"])
+            # Registry staging path: if the tool itself staged the edit
+            # (active session via STAGING_REGISTRY), surface the cumulative
+            # review panel to the UI.
+            if ok and isinstance(result_text, str) and result_text.startswith("STAGED:"):
+                path_str = tc["args"].get("path", "") or ""
+                operation = "edit" if tc["name"] == "edit_file" else "overwrite"
+                tasks = STAGING_REGISTRY.get_tasks(thread_id) if thread_id else {}
+                preview = {"old": "", "new": ""}
+                if operation == "edit":
+                    preview = {
+                        "old": (tc["args"].get("old_text") or "")[:_PREVIEW_MAX_CHARS],
+                        "new": (tc["args"].get("new_text") or "")[:_PREVIEW_MAX_CHARS],
+                    }
+                else:
+                    preview = {
+                        "old": "",
+                        "new": (tc["args"].get("content") or "")[:_PREVIEW_MAX_CHARS],
+                    }
+                payload = {
+                    "path": path_str,
+                    "operation": operation,
+                    "preview": preview,
+                    "tasks": dict(tasks),
+                }
+                _emit_file_edit_approval_request(token_queue, payload)
             # Defensive truncation: even if _invoke_tool_sync didn't
             # truncate, cap the result here so chunk.tool_calls stays small.
             if len(result_text) > _TOOL_RESULT_MAX_CHARS:
@@ -294,6 +614,7 @@ def executor_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
 
     # === Write to plan file ===
     output_text = last_content or ""
+    success_messages: List[BaseMessage] = []
     try:
         if last_error:
             _mark_failed_with_log(plan, chunk_id, last_error, structured_log)
@@ -315,6 +636,8 @@ def executor_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
                     pass
         else:
             plan_store.mark_done(plan, chunk_id, output_text, tool_calls=structured_log)
+            # Surface the chunk result as an AIMessage so the user sees it.
+            success_messages = [AIMessage(content=output_text)]
             # Auto-queue the next chunk.
             nxt = plan_store.next_pending(plan)
             if nxt is None:
@@ -326,7 +649,7 @@ def executor_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
         pass
 
     return {
-        "messages": [],
+        "messages": success_messages,
         "route_intent": state.route_intent,
         "mode": state.mode,
         "chunk_retry_count": new_retry_count,

@@ -124,7 +124,7 @@ Copy `.env.example` → `.env` and uncomment what you need.
 | Key | Purpose |
 |---|---|
 | `USE_CLOUD_API` | Route LLM calls to OpenRouter (`true` / unset). |
-| `OPENROUTER_MODEL` | OpenRouter model slug (default: `qwen/qwen-2.5-coder-7b-instruct`). |
+| `OPENROUTER_MODEL` | OpenRouter model slug (default: `poolside/laguna-m.1:free`). |
 | `API_KEY` | OpenRouter API key. |
 | `voice_file` / `voice_json` | Piper TTS model + config paths. |
 | `wake_sound` | `.wav` played when switching to `turbo`. |
@@ -159,7 +159,7 @@ For machines that can't host local models:
 
 ```env
 USE_CLOUD_API=true
-OPENROUTER_MODEL=qwen/qwen-2.5-coder-7b-instruct
+OPENROUTER_MODEL=poolside/laguna-m.1:free
 API_KEY=sk-or-v1-your-key-here
 ```
 

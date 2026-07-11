@@ -56,8 +56,8 @@ _DEFAULT_HISTORY_CAP = 40
 def _is_small_model(llm) -> bool:
     """Heuristic: is this a small model that needs tighter context trimming?
 
-    Detection looks at common attributes Ollama / LangChain set on the
-    ChatOllama instance. If we can't tell, assume it's not small.
+    Inspects attributes Ollama / LangChain set on the chat instance.
+    Falls back to "not small" when nothing matches.
     """
     candidates = []
     for attr in ("model", "model_name"):
@@ -106,21 +106,11 @@ def _trim_history_for_model(state_messages: list, llm) -> list:
 def _filter_empty_tool_calls(tool_calls_list: List[dict]) -> List[dict]:
     """Drop hallucinated tool calls where any string arg is empty/None.
 
-    Small models (llama3.2:3b especially) hallucinate tool calls with
-    empty `code=""` or `pattern=""` rather than responding with text.
-    Filtering these out falls back to a normal text response.
-
-    Examples that get dropped:
-      - read_file(path="")
-      - search_files(pattern="")            (any string arg empty → drop)
-      - execute_python(code="")
-      - edit_file(path="x", old_text="", new_text="y")  (any empty → drop)
-      - some_tool(flag=True) with no string args but no other content
-
-    Examples that survive:
-      - open_app(query="discord")
-      - read_file(path="src/foo.py")
-      - execute_python(code="print('hi')")
+    Small models (llama3.2:3b) hallucinate tool calls with empty args
+    (e.g. code="", pattern="") instead of responding with text. Filtering
+    falls back to a normal text response. A call is dropped when any of
+    its string args is empty/whitespace, or when it has no meaningful
+    (non-empty) content at all.
     """
     if not tool_calls_list:
         return tool_calls_list

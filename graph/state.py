@@ -38,20 +38,19 @@ class VedState(BaseModel):
     loop_count: int = Field(default=0)
     mode: str = Field(default="standard")
     saved_memories: list = Field(default_factory=list)
-    # Web search signal (set by Path B evaluator when more external context is needed)
-    # and the results fetched in response. Path A reads/writes these too via chat_node.
     web_search_needed: bool = Field(default=False)
     web_search_results: list = Field(default_factory=list)
     self_healing: bool = Field(default=False)
-    # Set by intent_router_node when the user message looks like a
-    # multi-step / complex task (planning/complex-task signals or a long
-    # message that also has a tool-trigger verb). Read by
-    # `_route_after_intent` to decide whether Path A should go through
-    # the planner-executor pipeline or stay on the simple chat node.
     needs_planning: bool = Field(default=False)
-    # Planner-executor pipeline state. Set by planner_node, read by
-    # executor_node. Cleared when the plan finalizes or the planner
-    # emits DIRECT_ANSWER.
     active_plan_id: Optional[str] = Field(default=None)
     current_chunk_id: Optional[int] = Field(default=None)
     final_summary: Optional[str] = Field(default=None)
+    active_thread_id: str = Field(default="")
+    dual_role_phase: Literal["", "analyze", "execute", "stage"] = Field(default="")
+    fix_instruction: str = Field(default="")  # PLANNER_OUTPUT
+    target_file_path: str = Field(default="")
+    target_file_content: str = Field(default="")  # raw code snippet
+    executor_generated_code: str = Field(default="")  # updated code block
+    pending_file_targets: list = Field(default_factory=list)
+    completed_file_targets: list = Field(default_factory=list)
+    current_file_target_index: int = Field(default=0)

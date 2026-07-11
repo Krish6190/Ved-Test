@@ -2,7 +2,6 @@ import os
 import sys
 import subprocess
 import requests
-from langchain_core.messages import HumanMessage, AIMessage
 from __init__ import MODES
 
 class ChatbotCommandProcessor:

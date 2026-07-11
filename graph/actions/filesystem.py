@@ -19,8 +19,6 @@ Module rules (enforced by the chunk-1 acceptance grep):
   - No global mutable state.
 """
 from __future__ import annotations
-
-import os
 import re
 import shutil
 from pathlib import Path

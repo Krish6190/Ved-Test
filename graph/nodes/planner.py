@@ -19,21 +19,18 @@ Difference from the previous design:
     prior conversation context.
 """
 from __future__ import annotations
-
 import json
 import re
 from typing import Any, Dict, List, Optional, Tuple
-
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
-
 from data import plans as plan_store
 from graph.nodes._helpers import _build_rag_block
 from graph.nodes._hints import _FRESH_QUESTION_HINT
+from graph.nodes._stream_helpers import _stream_text
 from graph.nodes.planner_diagnostics import escalate, EscalationAction
 from graph.state import VedState
 from graph.tools.rag_retrieve import retrieve_rag
-
 
 # ---- Output marker parsing (unchanged) ----
 
@@ -54,9 +51,12 @@ _SKIP_CHUNK_RE = re.compile(
     r"SKIP_CHUNK\s+(\d+)(?:\s+REASON\s*:\s*(.*?))?(?=\n(?:CREATE_PLAN|EXECUTE_NEXT|FINAL_SUMMARY|DIRECT_ANSWER|ADD_CHUNK_AFTER|REPLACE_CHUNK|REMOVE_CHUNK|SKIP_CHUNK|RECOMMEND_CODER):|\Z)",
     re.DOTALL,
 )
+_RECOMMEND_CODER_RE = re.compile(
+    r"\bRECOMMEND_CODER_MODE(?:\s+REASON\s*:\s*(.*?))?(?=\n(?:CREATE_PLAN|EXECUTE_NEXT|FINAL_SUMMARY|DIRECT_ANSWER|ADD_CHUNK_AFTER|REPLACE_CHUNK|REMOVE_CHUNK|SKIP_CHUNK|RECOMMEND_CODER):|\Z)",
+    re.DOTALL,
+)
 def parse_planner_output(text: str) -> Tuple[str, Any]:
     """Parse planner text into (kind, payload).
-
     Kinds:
       - create_plan        -> list[str]   chunk instructions
       - direct_answer      -> str        answer text
@@ -80,9 +80,10 @@ def parse_planner_output(text: str) -> Tuple[str, Any]:
                 return "create_plan", chunks
         except Exception:
             pass
-    # NOTE: RECOMMEND_CODER_MODE has been removed from the planner entirely.
-    # Path A can now run execute_python natively, so the planner always
-    # proceeds to CREATE_PLAN or DIRECT_ANSWER — no safety recommendation.
+    m = _RECOMMEND_CODER_RE.search(text)
+    if m:
+        reason = (m.group(1) or "").strip()
+        return "recommend_coder", reason
     m = _DIRECT_ANSWER_RE.search(text)
     if m:
         answer = m.group(1).strip()
@@ -138,9 +139,16 @@ _PLANNER_SYSTEM = SystemMessage(content=(
     "file/data to act on, and any context from prior chunks the executor "
     "needs. List 1-5 chunks.\n"
     "\n"
+    "  RECOMMEND_CODER_MODE REASON: <why coder mode is needed>\n"
+    "    Use ONLY when the current mode is standard/turbo and the user "
+    "asks to WRITE, EDIT, DELETE, or otherwise modify files or run code. "
+    "Do NOT emit DIRECT_ANSWER with editing instructions — tell the user "
+    "to switch to coder mode instead.\n"
+    "\n"
     "  DIRECT_ANSWER: <your answer>\n"
     "    Use when the task is SIMPLE and does not need any tools: factual "
-    "questions, chitchat, explanations, opinions.\n"
+    "questions, chitchat, explanations, opinions. Do NOT use for editing, "
+    "writing, or running code.\n"
     "\n"
     "  EXECUTE_NEXT\n"
     "    Use on subsequent turns when the plan is in progress and the "
@@ -302,14 +310,9 @@ def _build_planner_prompt(state: VedState, plan: Optional[Dict[str, Any]], confi
     last_user = user_msgs[-1].content if user_msgs else ""
 
     msgs = [_PLANNER_SYSTEM, _FRESH_QUESTION_HINT]
-
     # RAG auto-injection: same as chat_node does. Without this, a user
     # who uploads a file via /files/thread and then asks about it gets
     # a DIRECT_ANSWER with no awareness of the uploaded content. With
-    # this, the planner sees top-k relevant chunks inline.
-    # Source the thread id from config (chat_node does the same) — state
-    # has no thread field, and reusing active_plan_id here meant uploads
-    # were always queried in the wrong scope (None -> global fallback).
     active_thread_id = None
     if config and isinstance(config.get("configurable"), dict):
         active_thread_id = config["configurable"].get("active_thread_id")
@@ -392,6 +395,21 @@ def _build_planner_prompt(state: VedState, plan: Optional[Dict[str, Any]], confi
 # ---- Tool-call loop ----
 
 _MAX_PLANNER_TOOL_ROUNDS = 3
+_MAX_FALLBACK_RETRIES = 1  # re-prompt once if the model forgets markers
+
+
+# ---- Dual-role Planner (Thinker) prompt template ----
+
+_PLANNER_THINKER_PROMPT_TEMPLATE = (
+    "Find the logic error in this code snippet and write a single, clear "
+    "instruction explaining exactly how to rewrite the line to fix it. "
+    "Do not rewrite the full code. Code: {code}"
+)
+
+
+def _build_thinker_prompt(code_snippet: str) -> HumanMessage:
+    """Return the exact Planner (Thinker) prompt for a code snippet."""
+    return HumanMessage(content=_PLANNER_THINKER_PROMPT_TEMPLATE.format(code=code_snippet))
 
 
 def _execute_planner_tool_call(
@@ -499,6 +517,38 @@ def _stream_with_tool_loop(llm, msgs, config, token_queue, max_rounds=_MAX_PLANN
     return ai_msg, tool_messages, last_rag_results  # unreachable but satisfies the type checker
 
 
+# ---- Human-in-the-loop: plan approval gate ----
+
+def _wait_for_plan_approval(
+    token_queue,
+    proposed_chunks: List[str],
+    plan_approval_event,
+    plan_approval_state,
+) -> bool:
+    """Block until the user approves or rejects the proposed plan.
+
+    Emits a `("plan_approval_request", {"chunks": [...]})` event through
+    the token_queue, waits on `plan_approval_event`, then reads the
+    boolean decision out of `plan_approval_state["value"]`. The event is
+    cleared and the state value is reset to None before returning so the
+    next approval round starts from a clean slate.
+
+    Mirrors the pattern used by `content_pipeline_node` for the
+    content-generation approval gate. Returns True if the user approved,
+    False if they rejected.
+    """
+    if token_queue is not None:
+        try:
+            token_queue.put(("plan_approval_request", {"chunks": list(proposed_chunks)}))
+        except Exception:
+            pass
+    plan_approval_event.wait()
+    approved = bool(plan_approval_state.get("value"))
+    plan_approval_state["value"] = None
+    plan_approval_event.clear()
+    return approved
+
+
 # ---- Node ----
 
 def planner_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
@@ -525,13 +575,6 @@ def planner_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
                         plan = candidate
                         plan_id = pid
                         break
-
-    # Phase 4 escalation check: if any chunk has retry_count >= 4, halt
-    # the plan immediately without calling the LLM. Prevents infinite
-    # retry loops when a chunk's tool is broken or the task is genuinely
-    # impossible. Phases 1-3 are still handled by the normal LLM-driven
-    # flow (the planner sees the retry_count in the progress listing and
-    # emits REPLACE_CHUNK / SKIP_CHUNK accordingly).
     if plan is not None:
         for c in plan.get("chunks", []):
             if c.get("retry_count", 0) >= 4:
@@ -555,12 +598,6 @@ def planner_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
                         "active_plan_id": None,
                         "chunk_retry_count": 0,
                     }
-
-    # Resolve the LLM for this planner call. Production (chatbot.py)
-    # injects a mode-aware `planner_llm_factory` closure into
-    # config["configurable"]; tests that don't bother with the factory
-    # fall back to the legacy `get_llm` callable parameter. Either way
-    # the planner gets a ChatOllama bound to the right model.
     factory = None
     if config and isinstance(config.get("configurable"), dict):
         factory = config["configurable"].get("planner_llm_factory")
@@ -580,12 +617,94 @@ def planner_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
         token_queue = config["configurable"]["token_queue"]
     except (KeyError, TypeError):
         token_queue = None
+    plan_approval_event = None
+    plan_approval_state = None
+    if config and isinstance(config.get("configurable"), dict):
+        plan_approval_event = config["configurable"].get("plan_approval_event")
+        plan_approval_state = config["configurable"].get("plan_approval_state")
+    dual_phase = getattr(state, "dual_role_phase", "")
+    if dual_phase == "analyze":
+        code_snippet = getattr(state, "target_file_content", "") or ""
+        target_path = getattr(state, "target_file_path", "") or ""
+        if not code_snippet:
+            # No code loaded yet — ask the executor to read the file first.
+            updates = {
+                "messages": [],
+                "route_intent": "P",
+                "mode": state.mode,
+                "dual_role_phase": "read_target",
+            }
+            return updates
+        thinker_msgs = [
+            _PLANNER_SYSTEM,
+            _build_thinker_prompt(code_snippet),
+        ]
+        full_content = _stream_text(llm, thinker_msgs, token_queue)
+        return {
+            "messages": [],
+            "route_intent": "P",
+            "mode": state.mode,
+            "dual_role_phase": "execute",
+            "fix_instruction": full_content.strip(),
+        }
+    if dual_phase == "stage":
+        pending = list(getattr(state, "pending_file_targets", []) or [])
+        index = getattr(state, "current_file_target_index", 0) + 1
+        completed = list(getattr(state, "completed_file_targets", []) or [])
+        last_path = getattr(state, "target_file_path", "")
+        if last_path:
+            completed.append(last_path)
+        if index < len(pending):
+            return {
+                "messages": [],
+                "route_intent": "P",
+                "mode": state.mode,
+                "dual_role_phase": "analyze",
+                "current_file_target_index": index,
+                "target_file_path": pending[index],
+                "target_file_content": "",
+                "fix_instruction": "",
+                "executor_generated_code": "",
+                "completed_file_targets": completed,
+            }
+        return {
+            "messages": [],
+            "route_intent": "P",
+            "mode": state.mode,
+            "dual_role_phase": "",
+            "target_file_path": "",
+            "target_file_content": "",
+            "fix_instruction": "",
+            "executor_generated_code": "",
+            "completed_file_targets": completed,
+        }
 
     msgs_to_stream = _build_planner_prompt(state, plan, config)
-    ai_msg, tool_messages, last_rag_results = _stream_with_tool_loop(
-        llm_planner, msgs_to_stream, config, token_queue
-    )
+    ai_msg = None
+    tool_messages: List[ToolMessage] = []
+    last_rag_results: List[str] = []
+    for attempt in range(_MAX_FALLBACK_RETRIES + 1):
+        ai_msg, tool_messages, last_rag_results = _stream_with_tool_loop(
+            llm_planner, msgs_to_stream, config, token_queue
+        )
+        full_content = (
+            ai_msg.content if isinstance(ai_msg.content, str) else str(ai_msg.content)
+        )
+        kind, payload = parse_planner_output(full_content)
+        if kind != "fallback" or attempt == _MAX_FALLBACK_RETRIES:
+            break
+        reminder = HumanMessage(content=(
+            "Your previous response did not contain one of the required "
+            "output markers. Output EXACTLY ONE of:\n"
+            "  CREATE_PLAN: [\"...\", \"...\"]\n"
+            "  DIRECT_ANSWER: <text>\n"
+            "  EXECUTE_NEXT\n"
+            "  FINAL_SUMMARY: <text>\n"
+            "Do not add conversational filler."
+        ))
+        msgs_to_stream = list(msgs_to_stream) + [ai_msg] + tool_messages + [reminder]
 
+    assert ai_msg is not None
     full_content = ai_msg.content if isinstance(ai_msg.content, str) else str(ai_msg.content)
     kind, payload = parse_planner_output(full_content)
 
@@ -602,22 +721,30 @@ def planner_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
                 token_queue.put(("plan_update", {"event": "direct_answer"}))
         except Exception:
             pass
-
-    # New design: only user-facing responses (DIRECT_ANSWER and FINAL_SUMMARY)
-    # get stored in state.messages. Intermediate markers (CREATE_PLAN,
-    # EXECUTE_NEXT) return empty messages — the plan file holds the
-    # context for those, and the planner reads it on the next turn.
     updates: Dict[str, Any] = {
         "messages": [],
         "route_intent": state.route_intent, "mode": state.mode,
     }
-
     if kind == "create_plan":
         user_msgs = [m for m in state.messages if isinstance(m, HumanMessage)]
         task = user_msgs[-1].content if user_msgs else ""
+        if plan_approval_event is not None and plan_approval_state is not None:
+            approved = _wait_for_plan_approval(
+                token_queue, payload, plan_approval_event, plan_approval_state
+            )
+            if not approved:
+                return {
+                    "messages": [AIMessage(content=(
+                        "Plan rejected. Please refine your request and I'll "
+                        "draft a new plan that better fits what you want."
+                    ))],
+                    "route_intent": "A",
+                    "mode": state.mode,
+                    "active_plan_id": None,
+                    "current_chunk_id": None,
+                }
+
         new_plan = plan_store.make_blank_plan(task, payload)
-        # Attach any retrieve_rag results from this planner turn to each
-        # new chunk so the executor can surface them as background context.
         if last_rag_results:
             for chunk in new_plan["chunks"]:
                 chunk["context_blocks"] = list(last_rag_results)
@@ -627,23 +754,14 @@ def planner_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
         updates["active_plan_id"] = new_plan["plan_id"]
         updates["current_chunk_id"] = first["id"]
         updates["route_intent"] = "P"
-        # messages already []
-
     elif kind == "execute_next":
         if plan is None:
             updates["route_intent"] = state.route_intent
             return updates
-        # The executor_node already wrote its output to the plan file via
-        # mark_done. We just need to confirm the plan state is consistent
-        # and pick the next chunk.
         if plan.get("current_chunk") is not None:
-            # If for some reason the executor didn't mark_done (e.g. it
-            # returned early), the chunk is still 'executing'. Leave it
-            # alone — the executor will re-run on the next iteration.
             pass
         nxt = plan_store.next_pending(plan)
         if nxt is None:
-            # No more chunks — next planner call will emit FINAL_SUMMARY.
             updates["route_intent"] = "P_FINALIZE"
             plan_store.save_plan(plan)
         else:
@@ -653,9 +771,6 @@ def planner_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
             updates["route_intent"] = "P"
 
     elif kind == "add_chunk_after":
-        # FIM-style: insert a new pending chunk after `anchor_id`.
-        # Used when the executor fails and the planner wants to add a
-        # fix-up step before retrying the failed chunk.
         if plan is None:
             updates["route_intent"] = state.route_intent
             return updates
@@ -679,7 +794,6 @@ def planner_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
             updates["route_intent"] = "P"
 
     elif kind == "replace_chunk":
-        # FIM-style: overwrite a chunk's instruction. Status resets to pending.
         if plan is None:
             updates["route_intent"] = state.route_intent
             return updates
@@ -717,8 +831,6 @@ def planner_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
                     }))
                 except Exception:
                     pass
-            # If there are remaining pending chunks, route to executor;
-            # otherwise the next planner turn will emit FINAL_SUMMARY.
             nxt = plan_store.next_pending(plan)
             if nxt is None:
                 updates["route_intent"] = "P_FINALIZE"
@@ -731,11 +843,6 @@ def planner_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
             updates["route_intent"] = "P"
 
     elif kind == "skip_chunk":
-        # Mark the failed chunk as skipped. next_pending() automatically
-        # skips status=skipped chunks, so the next executor turn picks up
-        # the following pending chunk (or we route to FINALIZE if none).
-        # Use when the failure is non-critical — executor error or a benign
-        # tool bug that downstream chunks don't depend on.
         if plan is None:
             updates["route_intent"] = state.route_intent
             return updates
@@ -765,8 +872,6 @@ def planner_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
 
     elif kind == "final_summary":
         if plan is not None:
-            # The plan file already has all chunk outputs. Just record
-            # the final summary.
             plan_store.finalize(plan, payload)
             plan_store.save_plan(plan)
         # Store the user-facing final answer.
@@ -776,10 +881,18 @@ def planner_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
         updates["current_chunk_id"] = None
         updates["route_intent"] = "A"
 
+    elif kind == "recommend_coder":
+        updates["route_intent"] = "A"
+        reason = payload or "This task needs file-editing tools."
+        updates["messages"] = [AIMessage(content=(
+            f"This request looks like a coding/file-editing task. "
+            f"Please switch to `coder` mode to use the full tool set. "
+            f"Reason: {reason}"
+        ))]
+        updates["active_plan_id"] = None
+
     elif kind == "direct_answer":
         updates["route_intent"] = "A"
-        # Store the direct response. Tool messages from retrieve_rag are
-        # not stored (planner can re-query on the next turn if needed).
         updates["messages"] = [AIMessage(content=payload)]
         updates["active_plan_id"] = None
 
@@ -789,4 +902,3 @@ def planner_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
         updates["active_plan_id"] = None
 
     return updates
-

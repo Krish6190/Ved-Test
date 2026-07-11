@@ -8,13 +8,7 @@ Verifies:
 """
 import json
 import queue
-import sys
 import threading
-from pathlib import Path
-from unittest.mock import patch
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
 import data.plans as plan_store
 import graph.nodes.executor as executor_mod
 from langchain_core.messages import AIMessage

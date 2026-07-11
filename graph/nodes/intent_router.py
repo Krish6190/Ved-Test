@@ -8,19 +8,11 @@ the planner decides whether to DIRECT_ANSWER (simple) or CREATE_PLAN
 (one or more chunks executed by the executor node with full VED_TOOLS).
 """
 from __future__ import annotations
-
 import re
-
 from langchain_core.messages import HumanMessage
-
 from graph.state import VedState
 from graph.nodes._helpers import _TOOL_TRIGGER_RE
 
-
-# ---- Pattern tables ----
-
-# Self-healing phrases still set a flag so tools can restrict their scope,
-# but they no longer change the route (everything is Path A now).
 _SELF_HEAL_PHRASES = (
     "self heal", "self-heal", "self-healing",
     "heal yourself", "heal itself",
@@ -28,12 +20,6 @@ _SELF_HEAL_PHRASES = (
     "repair yourself", "repair your code", "repair itself",
     "self repair", "self-repair",
 )
-
-# Planning / complex-task signals. When a Path-A message matches one of
-# these (or is long + tool-triggering), we route through the planner-
-# executor pipeline instead of the simple standalone_chat node. Kept
-# intentionally broad-but-cheap: this is a router, not a planner; the
-# planner will still decide DIRECT_ANSWER vs CREATE_PLAN.
 _PLANNING_SIGNAL_RE = re.compile(
     r"\b("
     r"plan|planning|"
@@ -56,8 +42,6 @@ _PLANNING_SIGNAL_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Length threshold above which a tool-triggering message is treated as
-# complex and pushed through the planner.
 _PLANNING_LONG_MESSAGE_LEN = 250
 
 # Content-generation triggers. These produce multi-pass drafts (Path B).
@@ -70,7 +54,6 @@ _LENGTH_SPEC_RE = re.compile(
 _GENERATION_VERB_RE = re.compile(
     r"^(write|draft|compose|author)\s+"
 )
-# Narrowed: dropped write*/draft*/compose* generic prefixes (too broad),
 # dropped summary/summarize (those need file-read tools — Path A handles),
 # added poem/speech as clearly-prose signals.
 _GENERATION_PHRASES = (
@@ -148,10 +131,6 @@ def intent_router_node(state: VedState, get_llm) -> dict:
             result["needs_planning"] = _compute_needs_planning(last_user_text)
         return result
 
-    # 3-5. Content-generation signals -> Path B (the multi-pass draft pipeline).
-    # Length spec alone is too broad (any "5 paragraphs" hit B even with
-    # non-prose verbs). Require the length spec to be paired with a prose
-    # verb OR a content-gen phrase; otherwise fall through to Path A.
     has_length_spec = bool(_LENGTH_SPEC_RE.search(lower_text))
     has_prose_verb = bool(_GENERATION_VERB_RE.match(lower_text))
     has_content_phrase = any(p in lower_text for p in _GENERATION_PHRASES)
@@ -162,17 +141,11 @@ def intent_router_node(state: VedState, get_llm) -> dict:
     if has_content_phrase:
         return {"route_intent": "B", "self_healing": self_healing}
 
-    # 6. Slash commands route to A as a fallback. (command_processor.py
-    # actually handles most slash commands before they reach the graph,
-    # so this branch is rarely hit, but it's defensive.)
     if lower_text.startswith("/"):
         result = {"route_intent": "A", "self_healing": self_healing}
         if state.mode != "coder":
             result["needs_planning"] = _compute_needs_planning(last_user_text)
         return result
-
-    # 7. Default -> A. The planner will decide plan vs direct answer;
-    #    the executor will call tools if needed.
     result = {"route_intent": "A", "self_healing": self_healing}
     if state.mode != "coder":
         result["needs_planning"] = _compute_needs_planning(last_user_text)

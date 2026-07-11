@@ -9,22 +9,13 @@ These tests lock in:
     honors the `paths=` filter when it does.
   - executor_node handles chunks without context_blocks cleanly.
 """
-
 import queue
-import sys
 import threading
-
 import pytest
-from pathlib import Path
-from unittest.mock import MagicMock
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
 import data.plans as plan_store
 import graph.nodes.executor as executor_mod
 from graph.nodes import planner as planner_mod
 from graph.rag import rag_db
-from graph.tools import PATH_A_EXECUTOR_TOOLS, VED_TOOLS
 from graph.tools.rag_retrieve import retrieve_rag
 
 

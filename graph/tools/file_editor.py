@@ -29,6 +29,7 @@ from graph.tools._common import (
     is_safe_self_healing,
     resolve_implicit_target,
 )
+from graph.tools.staging_registry import STAGING_REGISTRY
 
 def _request_approval(path: Path, old: str, new: str, self_healing: bool, overwrite: bool) -> bool:
     # tkinter is imported lazily so this module can be imported (e.g. during
@@ -117,6 +118,10 @@ def edit_file(
 
     Returns:
         Status string describing the result, or `ERROR: ...` on failure.
+        When running inside a managed response (active_thread_id set in
+        state), the edit is staged in memory and a `STAGED: ...` marker is
+        returned; the physical file is not touched until the user approves
+        the change in the review panel.
     """
     self_healing = bool(getattr(state, "self_healing", False))
 
@@ -136,6 +141,23 @@ def edit_file(
     if err:
         return err
 
+    thread_id = getattr(state, "active_thread_id", "")
+    if thread_id and STAGING_REGISTRY.has_session(thread_id):
+        # Managed response path: stage in memory, do not touch disk.
+        args = {
+            "path": str(resolved),
+            "old_text": old_text,
+            "new_text": new_text,
+        }
+        preview = {
+            "old": old_text[:300],
+            "new": new_text[:300],
+        }
+        return STAGING_REGISTRY.stage_edit(
+            thread_id, "edit_file", str(resolved), args, preview
+        )
+
+    # Legacy / headless path: block with a popup and write directly.
     if not _request_approval(resolved, old_text, new_text, self_healing, overwrite=False):
         return "ERROR: User denied edit authorization."
 
@@ -166,6 +188,10 @@ def overwrite_file(
 
     Returns:
         Status string describing the result, or `ERROR: ...` on failure.
+        When running inside a managed response (active_thread_id set in
+        state), the overwrite is staged in memory and a `STAGED: ...`
+        marker is returned; the physical file is not touched until the
+        user approves the change in the review panel.
     """
     self_healing = bool(getattr(state, "self_healing", False))
 
@@ -179,6 +205,19 @@ def overwrite_file(
     if err:
         return err
 
+    thread_id = getattr(state, "active_thread_id", "")
+    if thread_id and STAGING_REGISTRY.has_session(thread_id):
+        # Managed response path: stage in memory, do not touch disk.
+        args = {"path": str(resolved), "content": content}
+        preview = {
+            "old": "",
+            "new": content[:300],
+        }
+        return STAGING_REGISTRY.stage_edit(
+            thread_id, "overwrite_file", str(resolved), args, preview
+        )
+
+    # Legacy / headless path: block with a popup and write directly.
     if not _request_approval(resolved, "", content, self_healing, overwrite=True):
         return "ERROR: User denied overwrite authorization."
 

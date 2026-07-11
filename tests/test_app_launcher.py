@@ -8,13 +8,8 @@ Tests cover:
   - Nickname normalization (vscode -> Visual Studio Code)
 """
 import queue
-import sys
 import threading
-from pathlib import Path
 from unittest.mock import MagicMock, patch
-
-import pytest
-
 import graph.tools.app_launcher as al
 
 

@@ -7,22 +7,11 @@ Issue 2: RAG context is auto-injected into the planner's message stream
          so the LLM sees uploaded file content without an explicit
          retrieve_rag call.
 """
-import sys
-from pathlib import Path
 from unittest.mock import patch
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
-
 from graph.nodes import planner as planner_mod
-from graph.nodes import planner_prompt as prompt_mod
-from graph.nodes import _helpers as helpers_mod
 from graph.state import VedState
-from graph.nodes.planner_prompt import (
-    _PLANNER_SYSTEM,
-    _build_planner_prompt,
-)
+from graph.nodes.planner_prompt import _PLANNER_SYSTEM, _build_planner_prompt
 from graph.nodes.planner_markers import parse_planner_output
 
 
@@ -69,7 +58,7 @@ def test_planner_prompt_includes_rag_block_when_rag_returns_results():
         "(2) [thread] setup.py\nPackage configuration goes here."
     )
 
-    with patch.object(prompt_mod, "_build_rag_block", return_value=fake_rag_block):
+    with patch.object(planner_mod, "_build_rag_block", return_value=fake_rag_block):
         msgs = _build_planner_prompt(state, plan=None)
 
     # At least one SystemMessage in the stream contains the RAG block.
@@ -85,7 +74,7 @@ def test_planner_prompt_handles_missing_rag_block_gracefully():
     prompt still builds successfully without crashing."""
     state = VedState(messages=[HumanMessage(content="hello")], route_intent="A")
 
-    with patch.object(prompt_mod, "_build_rag_block", return_value=""):
+    with patch.object(planner_mod, "_build_rag_block", return_value=""):
         msgs = _build_planner_prompt(state, plan=None)
 
     # No SystemMessage with [RAG Context] marker.
@@ -100,7 +89,7 @@ def test_planner_prompt_handles_rag_exception_gracefully():
     planner prompt still builds without crashing."""
     state = VedState(messages=[HumanMessage(content="hello")], route_intent="A")
 
-    with patch.object(prompt_mod, "_build_rag_block", side_effect=RuntimeError("rag down")):
+    with patch.object(planner_mod, "_build_rag_block", side_effect=RuntimeError("rag down")):
         msgs = _build_planner_prompt(state, plan=None)
 
     # Prompt still builds.

@@ -26,23 +26,12 @@ Usage in executor_node (planned for Phase 3.2 refactor):
             rt.mark_done()
 """
 from __future__ import annotations
-
 import copy
 import time
 from typing import Any, Dict, List, Optional
-
 from langchain_core.tools import BaseTool
-
-# Maximum message buffer size — prevents unbounded growth if the LLM
-# loops too many times. Older messages are dropped, keeping the system
-# prompt and the most recent context.
 _MAX_MESSAGES = 50
-
-# Default per-chunk wall timeout (seconds). Runtime forces the loop to
-# break and marks the chunk failed if exceeded. Configurable via the
-# ExecutorRuntime constructor or env var VED_CHUNK_TIMEOUT.
 _DEFAULT_WALL_TIMEOUT = 90.0
-
 
 class ExecutorRuntime:
     """Short-lived context manager for one executor chunk.
@@ -94,16 +83,11 @@ class ExecutorRuntime:
 
     def __enter__(self) -> "ExecutorRuntime":
         self.started_at = time.time()
-        # Shallow-copy tools to prevent cross-chunk state mutation.
-        # Most LangChain tools are thin stateless wrappers; copy.copy is
-        # sufficient. If a tool has explicit close()/reset() methods,
-        # those are called on exit.
         self.tools = [_copy_tool(t) for t in self._tools_source]
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         self.ended_at = time.time()
-        # Release tool resources if they expose close()/reset().
         for t in self.tools:
             try:
                 closer = getattr(t, "close", None)
@@ -117,7 +101,6 @@ class ExecutorRuntime:
                     resetter()
             except Exception:
                 pass
-        # Clear all per-chunk state so nothing leaks to the next chunk.
         self.scratch.clear()
         self.messages.clear()
         self.tools.clear()
@@ -174,8 +157,6 @@ class ExecutorRuntime:
         """Bound the message buffer to _MAX_MESSAGES. Keeps first + recent."""
         if len(self.messages) <= _MAX_MESSAGES:
             return
-        # Keep the first message (typically the system prompt) plus the
-        # most recent (_MAX_MESSAGES - 1) messages.
         head = self.messages[:1]
         tail = self.messages[-(self._MAX_MESSAGES - 1):]
         self.messages = head + tail

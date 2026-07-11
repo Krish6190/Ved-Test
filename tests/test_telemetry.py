@@ -1,13 +1,9 @@
 """Unit tests for the telemetry module + its auth and API integration."""
 from __future__ import annotations
-
 import json
 import time
 from pathlib import Path
-
 import pytest
-
-import telemetry
 from telemetry import ACTIVE_TIMEOUT_SECONDS, Telemetry, telemetry as global_telemetry
 
 

@@ -6,12 +6,6 @@ from pathlib import Path
 # work without requiring the user to export them in their shell. Mirrors
 # voice/voice_module.py's pattern. Best-effort: if python-dotenv isn't
 # installed, fall back to a minimal built-in loader.
-try:
-    from dotenv import load_dotenv as _load_dotenv
-    _load_dotenv()
-except ImportError:
-    _load_env_fallback()
-
 
 def _load_env_fallback() -> None:
     """Minimal .env loader used only if python-dotenv is unavailable.
@@ -37,6 +31,11 @@ def _load_env_fallback() -> None:
                 os.environ[key] = value
     except Exception:
         pass
+try:
+    from dotenv import load_dotenv as _load_dotenv
+    _load_dotenv()
+except ImportError:
+    _load_env_fallback()
 
 class ModelAdapter:
     def __init__(self, model_name: str = "local-stub", device: str = "cpu", params=None, system_prompt: str = ""):
@@ -130,7 +129,7 @@ def _build_ollama_llm(model_name: str, *, base_url: str, device: str, params: di
                     "USE_CLOUD_API=true requires `pip install langchain-openai`."
                 ) from exc
             openrouter_model = os.getenv(
-                "OPENROUTER_MODEL", "qwen/qwen-2.5-coder-7b-instruct",
+                "OPENROUTER_MODEL", "poolside/laguna-m.1:free",
             )
             temperature = float(params.get("temperature", 0.1))
             return ChatOpenAI(

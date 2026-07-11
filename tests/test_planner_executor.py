@@ -4,12 +4,7 @@ Pure-Python tests; no LLM required.
   - data.plans: file I/O + mutators
   - graph.nodes.planner.parse_planner_output: marker parsing
 """
-import json
-import sys
 from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
 import data.plans as plan_store
 import graph.nodes.planner as planner_mod
 

@@ -9,9 +9,7 @@ math with table-driven pytest cases.
 
 Run with: `python -m pytest tests/test_ambient_calibration.py -v`
 """
-import numpy as np
 import pytest
-
 from voice.voice_module import _compute_silence_threshold
 
 

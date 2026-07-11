@@ -11,10 +11,12 @@ from graph.nodes.planner import (
     _build_planner_prompt,
     _recent_human_ai,
 )
+from graph.nodes._helpers import _build_rag_block
 
 __all__ = [
     "_MSG_HISTORY_CAP",
     "_PLANNER_SYSTEM",
     "_build_planner_prompt",
+    "_build_rag_block",
     "_recent_human_ai",
 ]

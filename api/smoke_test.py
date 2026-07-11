@@ -8,15 +8,11 @@ Exits 0 if all checks pass, 1 otherwise. Requires httpx (already in
 requirements.txt) and a running FastAPI server (does NOT start one).
 """
 from __future__ import annotations
-
 import asyncio
 import io
-import json
 import os
 import sys
-import time
 from typing import Any, Awaitable, Callable, List, Tuple
-
 import httpx
 
 API_URL = os.getenv("VED_API_URL", "http://127.0.0.1:8000").rstrip("/")

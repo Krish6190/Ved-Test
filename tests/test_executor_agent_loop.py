@@ -8,16 +8,9 @@ Covers:
   - Standard mode correctly restricts to PATH_A_EXECUTOR_TOOLS
 """
 import queue
-import sys
 import threading
-from pathlib import Path
-from unittest.mock import MagicMock
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
 import data.plans as plan_store
 import graph.nodes.executor as executor_mod
-from graph.tools import PATH_A_EXECUTOR_TOOLS, VED_TOOLS
 
 
 # ---- helpers ----

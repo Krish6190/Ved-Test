@@ -1,21 +1,13 @@
 import os
-import sys
-import time
 import threading
 import tkinter as tk
 import winsound
-from pathlib import Path
-
-sys.path.append(str(Path(__file__).resolve().parent.parent))
 from voice.voice_module import VoiceSystem
 from chatbot import Chatbot
 from .gui_rag_worker import VedRagWorker
 from .components import MODE_COLORS
 
 # Telemetry — registers an active-user session on GUI startup, sends
-# heartbeats on each prompt, and ends the session when the window closes.
-# All calls are best-effort: if telemetry can't be imported or fails, the
-# GUI keeps working normally.
 try:
     from telemetry import telemetry as _telemetry
 except Exception:  # pragma: no cover - import-failure fallback
@@ -28,16 +20,11 @@ class VedWidget(VedRagWorker):
         super().__init__(root)
         self.chatbot = Chatbot()
         # Wire the UI components into the chatbot so command_processor._handle_cd()
-        # can push cwd updates to the title-bar chip, and on_session_start()
-        # can push index-status updates. Both chips get seeded with their
-        # initial values here. Best-effort: failures don't block startup.
         try:
             self.chatbot.set_ui_components(self)
         except Exception:
             pass
         # Telemetry: register this GUI window as an active session.
-        # The session_id is stored so the close handler can end exactly
-        # this session without touching other clients (API, other GUIs).
         self._telemetry_session_id: str | None = None
         try:
             if _telemetry is not None:
@@ -53,7 +40,6 @@ class VedWidget(VedRagWorker):
         self.chat_history = []
         self.is_generating = False
         # Modern file-input: staged attachments shown as chips above the input row.
-        # Populated by _trigger_file_attachment, drained by _send_command.
         self.pending_attachments = []
         self.chip_frame = tk.Frame(self.root, bg="#090a0f")
 
@@ -82,10 +68,8 @@ class VedWidget(VedRagWorker):
         self.cmd_popup = None
         self.cmd_listbox = None
         self.input_entry.bind("<KeyRelease>", self._on_input_keyrelease)
-
         self._hide_from_screen_capture()
         self._update_mode_ui(self.current_mode)
-
         # Populate the freshly-built tab strip from the active chatbot state.
         self._refresh_thread_tabs()
         self._render_active_thread()
@@ -302,16 +286,212 @@ class VedWidget(VedRagWorker):
             bd=0, font=("Segoe UI", 10, "bold"), padx=10, cursor="hand2",
         )
         self.approval_no_btn.pack(side="left", padx=2, pady=4)
-        # Hidden until approval_request arrives.
         self._approval_bar_visible = False
+        self._pending_approval_kind = None
 
     def _show_approval_bar(self, pass_num: int):
         if getattr(self, "_approval_bar_visible", False):
             return
+        self._pending_approval_kind = "content"
         self.approval_label.config(text=f"Pass {pass_num}/3 — is this draft good enough?")
+        self.approval_no_btn.config(text="\u2717 No (regenerate)")
         # Pack just above the input frame so it stays anchored to the bottom.
         self._approval_bar.pack(side="bottom", fill="x", before=self.input_frame)
         self._approval_bar_visible = True
+
+    def _show_plan_approval_bar(self, num_steps: int):
+        """Variant of _show_approval_bar used by the planner-executor
+        pipeline (Path A). Reuses the same Yes/No bar but updates the
+        prompt text and the No button so it reads naturally for a plan
+        decision rather than a content regeneration."""
+        if getattr(self, "_approval_bar_visible", False):
+            return
+        self._pending_approval_kind = "plan"
+        self.approval_label.config(
+            text=f"Planner proposes {num_steps} step(s) — approve this plan?"
+        )
+        self.approval_no_btn.config(text="\u2717 No (reject)")
+        self._approval_bar.pack(side="bottom", fill="x", before=self.input_frame)
+        self._approval_bar_visible = True
+
+    # ------------------------------------------------------------------ #
+    # Cumulative multi-file file-edit review panel (Cursor-style)
+    # ------------------------------------------------------------------ #
+    def _build_file_edit_review_panel(self):
+        """Create a persistent review panel for pending file edits.
+
+        The panel is a Toplevel window that accumulates edits across
+        multiple files. It displays a file list on the left and a diff
+        preview on the right. The user can approve/reject all files at
+        once or act on individual files.
+        """
+        panel = tk.Toplevel(self.root)
+        panel.title("Review file edits")
+        panel.configure(bg="#161b26")
+        panel.geometry("700x450")
+        panel.protocol("WM_DELETE_WINDOW", lambda: None)  # disable close
+        panel.transient(self.root)
+        panel.attributes("-topmost", True)
+
+        header = tk.Frame(panel, bg="#161b26", height=36)
+        header.pack(side="top", fill="x")
+        tk.Label(
+            header, text="Pending file edits", bg="#161b26", fg="#cdd6f4",
+            font=("Segoe UI", 11, "bold"),
+        ).pack(side="left", padx=10, pady=6)
+
+        btn_frame = tk.Frame(header, bg="#161b26")
+        btn_frame.pack(side="right", padx=10, pady=4)
+        tk.Button(
+            btn_frame, text="Approve all", command=self._on_file_edit_approve_all,
+            bg="#a6e3a1", fg="#1e1e2e", activebackground="#b6f3c1",
+            bd=0, font=("Segoe UI", 9, "bold"), padx=10, cursor="hand2",
+        ).pack(side="left", padx=2)
+        tk.Button(
+            btn_frame, text="Reject all", command=self._on_file_edit_reject_all,
+            bg="#f38ba8", fg="#1e1e2e", activebackground="#f5a3c3",
+            bd=0, font=("Segoe UI", 9, "bold"), padx=10, cursor="hand2",
+        ).pack(side="left", padx=2)
+
+        body = tk.Frame(panel, bg="#161b26")
+        body.pack(side="top", fill="both", expand=True, padx=8, pady=(0, 8))
+
+        # Left: scrollable file list + per-file actions
+        list_frame = tk.Frame(body, bg="#161b26", width=220)
+        list_frame.pack(side="left", fill="y")
+        list_frame.pack_propagate(False)
+        self._file_edit_listbox = tk.Listbox(
+            list_frame, bg="#1e2030", fg="#cdd6f4", selectbackground="#313244",
+            selectforeground="#cdd6f4", highlightthickness=0, bd=0,
+            font=("Segoe UI", 10), activestyle="none",
+        )
+        self._file_edit_listbox.pack(side="top", fill="both", expand=True)
+        list_scroll = tk.Scrollbar(list_frame, command=self._file_edit_listbox.yview, bg="#1e2030")
+        list_scroll.pack(side="right", fill="y")
+        self._file_edit_listbox.config(yscrollcommand=list_scroll.set)
+        self._file_edit_listbox.bind("<<ListboxSelect>>", self._on_file_edit_selected)
+        per_file_btns = tk.Frame(list_frame, bg="#161b26")
+        per_file_btns.pack(side="bottom", fill="x", pady=(6, 0))
+        tk.Button(
+            per_file_btns, text="Approve", command=self._on_file_edit_approve_selected,
+            bg="#a6e3a1", fg="#1e1e2e", activebackground="#b6f3c1",
+            bd=0, font=("Segoe UI", 8, "bold"), padx=6, cursor="hand2",
+        ).pack(side="left", padx=(0, 2), expand=True, fill="x")
+        tk.Button(
+            per_file_btns, text="Reject", command=self._on_file_edit_reject_selected,
+            bg="#f38ba8", fg="#1e1e2e", activebackground="#f5a3c3",
+            bd=0, font=("Segoe UI", 8, "bold"), padx=6, cursor="hand2",
+        ).pack(side="left", padx=(2, 0), expand=True, fill="x")
+
+        # Right: diff preview
+        diff_frame = tk.Frame(body, bg="#161b26")
+        diff_frame.pack(side="left", fill="both", expand=True, padx=(8, 0))
+        self._file_edit_diff_label = tk.Label(
+            diff_frame, text="Select a file to review", bg="#1e2030", fg="#6c7086",
+            font=("Segoe UI", 10), anchor="nw", justify="left",
+        )
+        self._file_edit_diff_label.pack(side="top", fill="x", pady=(0, 4))
+        self._file_edit_diff_text = tk.Text(
+            diff_frame, bg="#0b0c15", fg="#cdd6f4", wrap="word",
+            font=("Consolas", 9), highlightthickness=0, bd=0, padx=8, pady=8,
+            state="disabled",
+        )
+        self._file_edit_diff_text.pack(side="top", fill="both", expand=True)
+        diff_scroll = tk.Scrollbar(diff_frame, command=self._file_edit_diff_text.yview, bg="#1e2030")
+        diff_scroll.pack(side="right", fill="y")
+        self._file_edit_diff_text.config(yscrollcommand=diff_scroll.set)
+
+        self._file_edit_review_panel = panel
+        self._file_edit_pending_tasks: dict = {}
+
+    def _update_file_edit_review_panel(self, tasks: dict):
+        """Refresh the file list from the latest pending tasks snapshot."""
+        if not getattr(self, "_file_edit_review_panel", None) or not self._file_edit_review_panel.winfo_exists():
+            self._build_file_edit_review_panel()
+        self._file_edit_pending_tasks = dict(tasks)
+        selected_idx = self._file_edit_listbox.curselection()
+        selected_path = ""
+        if selected_idx:
+            selected_path = self._file_edit_listbox.get(selected_idx[0])
+        self._file_edit_listbox.delete(0, tk.END)
+        for path in sorted(tasks.keys()):
+            self._file_edit_listbox.insert(tk.END, path)
+        # Try to restore selection.
+        if selected_path:
+            for i in range(self._file_edit_listbox.size()):
+                if self._file_edit_listbox.get(i) == selected_path:
+                    self._file_edit_listbox.selection_set(i)
+                    break
+        if not self._file_edit_listbox.curselection() and self._file_edit_listbox.size() > 0:
+            self._file_edit_listbox.selection_set(0)
+        self._on_file_edit_selected()
+        self._file_edit_review_panel.deiconify()
+        self._file_edit_review_panel.lift()
+
+    def _on_file_edit_selected(self, event=None):
+        """Render the diff for the currently selected pending file."""
+        if not getattr(self, "_file_edit_diff_text", None):
+            return
+        sel = self._file_edit_listbox.curselection()
+        self._file_edit_diff_text.config(state="normal")
+        self._file_edit_diff_text.delete("1.0", tk.END)
+        self._file_edit_diff_label.config(text="Select a file to review")
+        if not sel:
+            self._file_edit_diff_text.config(state="disabled")
+            return
+        path = self._file_edit_listbox.get(sel[0])
+        task = self._file_edit_pending_tasks.get(path, {})
+        preview = task.get("preview", {}) or {}
+        operation = task.get("tool_name", "edit")
+        old_snippet = str(preview.get("old", "") or "")
+        new_snippet = str(preview.get("new", "") or "")
+        self._file_edit_diff_label.config(text=f"{path} ({operation})")
+        lines = [f"Path: {path}", f"Operation: {operation}", "", "--- old ---", old_snippet, "", "--- new ---", new_snippet]
+        self._file_edit_diff_text.insert("1.0", "\n".join(lines))
+        self._file_edit_diff_text.config(state="disabled")
+
+    def _submit_file_edit_decision(self, action: str, paths: list | None = None):
+        """Send a file-edit approval decision to the chatbot and close panel if empty."""
+        decision = {"action": action, "paths": list(paths) if paths else []}
+        try:
+            self.chatbot.submit_file_edit_approval(decision)
+        except Exception as e:
+            self._append_text(f"[System Error] Failed to submit file edit approval: {e}\n", MODE_COLORS["error"])
+        # The worker will remove approved/rejected entries; refresh on next event.
+
+    def _on_file_edit_approve_all(self):
+        self._submit_file_edit_decision("approve_all")
+
+    def _on_file_edit_reject_all(self):
+        self._submit_file_edit_decision("reject_all")
+        try:
+            if self._file_edit_review_panel.winfo_exists():
+                self._file_edit_review_panel.withdraw()
+        except Exception:
+            pass
+
+    def _on_file_edit_approve_selected(self):
+        sel = self._file_edit_listbox.curselection()
+        if not sel:
+            return
+        paths = [self._file_edit_listbox.get(i) for i in sel]
+        self._submit_file_edit_decision("approve", paths)
+
+    def _on_file_edit_reject_selected(self):
+        sel = self._file_edit_listbox.curselection()
+        if not sel:
+            return
+        paths = [self._file_edit_listbox.get(i) for i in sel]
+        self._submit_file_edit_decision("reject", paths)
+
+    def _show_file_edit_approval_bar(self, tasks: dict):
+        """Show or refresh the cumulative multi-file file-edit review panel.
+
+        The old single-file bar has been replaced by a Cursor-style review
+        panel that accumulates edits across files. This method is kept as a
+        thin wrapper for backwards compatibility with _consume_response.
+        """
+        self._update_file_edit_review_panel(tasks)
 
     def _hide_approval_bar(self):
         if not getattr(self, "_approval_bar_visible", False):
@@ -321,10 +501,33 @@ class VedWidget(VedRagWorker):
         except Exception:
             pass
         self._approval_bar_visible = False
+        self._pending_approval_kind = None
 
     def _on_approval_decision(self, approved: bool):
         # Runs on the main thread (Tk button callback).
+        kind = getattr(self, "_pending_approval_kind", None) or "content"
         self._hide_approval_bar()
+        if kind == "plan":
+            if approved:
+                self._append_text("\n[Human] Approved plan\n", "#a6e3a1")
+            else:
+                self._append_text("\n[Human] Rejected plan\n", "#f9e2af")
+            try:
+                self.chatbot.submit_plan_approval(approved)
+            except Exception as e:
+                self._append_text(f"[System Error] Failed to submit plan approval: {e}\n", MODE_COLORS["error"])
+            return
+        if kind == "file_edit":
+            if approved:
+                self._append_text("\n[Human] Approved file edit\n", "#a6e3a1")
+            else:
+                self._append_text("\n[Human] Rejected file edit\n", "#f9e2af")
+            try:
+                self.chatbot.submit_file_edit_approval(approved)
+            except Exception as e:
+                self._append_text(f"[System Error] Failed to submit file edit approval: {e}\n", MODE_COLORS["error"])
+            return
+        # Default: content-pipeline approval flow (preserves prior behavior).
         if approved:
             self._append_text("\n[Human] Approved — finalizing draft.\n", "#a6e3a1")
         else:
@@ -336,14 +539,9 @@ class VedWidget(VedRagWorker):
 
     def _send_command(self, prompt=None):
         # Chunk C: an optional explicit prompt arg lets the voice processor
-        # call this method synchronously via self.send_command(None). When the
-        # arg is None we read from the input box (the original Enter-key path).
         if prompt is None:
             prompt = self.input_entry.get("1.0", tk.END).strip()
-
         # Chunk C: interrupt any in-flight bot-response speech so the new
-        # prompt gets clean audio (and so the user immediately hears the
-        # cutoff, not a 5-second tail of the previous reply).
         voice = getattr(self, "voice", None)
         if voice is not None and hasattr(voice, "stop_tts"):
             try:
@@ -358,10 +556,6 @@ class VedWidget(VedRagWorker):
 
         if not prompt and not pending:
             return
-
-        # Telemetry: any prompt the user actually sends counts as activity.
-        # Refresh the heartbeat so idle-timeout doesn't mark this session
-        # inactive while the user is actively chatting.
         try:
             if _telemetry is not None and getattr(self, "_telemetry_session_id", None):
                 _telemetry.heartbeat(session_id=self._telemetry_session_id)
@@ -478,22 +672,12 @@ class VedWidget(VedRagWorker):
             if cleaned in MODE_COMMANDS or cleaned.startswith(("/deactivate coder", "/mode")):
                 self.current_mode = self.chatbot.mode
                 self.root.after(0, lambda: self._update_mode_ui(self.current_mode))
-            # If a thread command (/new, /switch, /rename, /delete, /clear, /threads)
-            # was handled inside respond(), the active thread may have changed.
-            # Refresh the tab strip + re-render so the visible log matches state.
             if isinstance(response_obj, str):
                 self.root.after(0, self._refresh_thread_tabs)
                 self.root.after(0, self._render_active_thread)
-            # Chunk C: return the assembled response string so the voice path
-            # can speak it via the interruptible TTS. Returning from inside
-            # the try block is fine — the `finally` below still runs and
-            # cleans up `is_generating` and focus.
             return full_response
         except Exception as e:
             self._append_text(f"\nChatbot error: {e}\n", MODE_COLORS["error"])
-            # Chunk C: return an empty string so the voice path doesn't try
-            # to speak the error text. `_reset_to_wake_word` is still called
-            # by the audio processor regardless of what we return.
             return ""
         finally:
             self.is_generating = False
@@ -519,6 +703,47 @@ class VedWidget(VedRagWorker):
                 except Exception:
                     pass_num = 0
                 self.root.after(0, lambda p=pass_num: self._show_approval_bar(p))
+            elif event_type == "plan_approval_request":
+                # Planner proposed a plan (Path A). Render the proposed steps
+                # in the chat area so the user can read them before deciding,
+                # then show the approval bar wired to submit_plan_approval.
+                chunks = []
+                if isinstance(chunk, dict):
+                    raw_chunks = chunk.get("chunks", [])
+                    if isinstance(raw_chunks, (list, tuple)):
+                        chunks = [str(c) for c in raw_chunks]
+                # Render the proposed plan as a simple formatted block.
+                rendered_lines = ["", "[Planner] Proposed plan:"]
+                if chunks:
+                    for idx, step in enumerate(chunks, start=1):
+                        rendered_lines.append(f"  {idx}. {step}")
+                else:
+                    rendered_lines.append("  (no steps provided)")
+                rendered_lines.append("")
+                block = "\n".join(rendered_lines) + "\n"
+                self._append_text(block, "#cdd6f4")
+                self.root.after(
+                    0,
+                    lambda n=len(chunks): self._show_plan_approval_bar(n),
+                )
+            elif event_type == "file_edit_approval_request":
+                payload = chunk if isinstance(chunk, dict) else {}
+                tasks = payload.get("tasks") or {}
+                if not tasks and payload.get("path"):
+                    # Backwards-compat for single-file payloads.
+                    tasks = {payload["path"]: payload}
+                operation = str(payload.get("operation", "edit"))
+                path = str(payload.get("path", ""))
+                filename = os.path.basename(path) if path else "<unknown>"
+                self._append_text(
+                    f"\n[Planner] Requesting approval to {operation} {filename} "
+                    f"({len(tasks)} pending file edit(s))\n",
+                    "#cdd6f4",
+                )
+                self.root.after(
+                    0,
+                    lambda t=tasks: self._show_file_edit_approval_bar(t),
+                )
             elif event_type == "error":
                 self._append_text(f"[System Error]: {chunk}\n", MODE_COLORS["error"])
 

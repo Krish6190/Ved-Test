@@ -6,14 +6,10 @@ returns the tmp directory. This prevents any writes to the real
 `data/threads.json`.
 """
 from pathlib import Path as RealPath
-
 import json
-
 import pytest
-
 import chatbot
 from chatbot import Chatbot
-from command_processor import ChatbotCommandProcessor
 from langchain_core.messages import HumanMessage, SystemMessage
 
 

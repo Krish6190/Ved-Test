@@ -12,9 +12,6 @@ Run with: `python -m pytest tests/test_confirm_keywords.py -v`
 """
 import sys
 from pathlib import Path
-
-import pytest
-
 from voice.audio_processors import _matches_any
 
 

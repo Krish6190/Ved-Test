@@ -12,8 +12,6 @@ thread-scoped uploads). The 2-layer AST chunking for code files is
 applied separately in Phase 2.2 (graph.rag.code_chunker).
 """
 from __future__ import annotations
-
-import fnmatch
 import hashlib
 import json
 import os

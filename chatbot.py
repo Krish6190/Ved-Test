@@ -9,6 +9,7 @@ from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, Tool
 from graph import build_graph
 from model_adapter import ModelAdapter, parse_modelfile
 from command_processor import ChatbotCommandProcessor
+from graph.tools.staging_registry import STAGING_REGISTRY
 import queue
 import threading
 
@@ -581,14 +582,12 @@ class Chatbot(ChatbotCommandProcessor):
             print("[DEBUG] stream generator started", flush=True)
             active = self.get_active_thread()
             was_empty = len(active["messages"]) == 0 and active["title"] == "New Thread"
-            # Per-thread pinned messages are already part of `history`
-            # (they live inside the thread with additional_kwargs["pinned"]=True).
-            # No cross-thread injection. The trimming logic in state.py
-            # preserves pinned messages from being dropped.
             history = active["messages"]
             initial_messages = list(history) + [HumanMessage(content=message)]
             if was_empty:
                 active["title"] = self._autotitle_from_message(message)
+            active = self.get_active_thread()
+            thread_id = active.get("id", "")
             input_state = {
                 "messages": initial_messages,
                 "route_intent": "",
@@ -597,14 +596,34 @@ class Chatbot(ChatbotCommandProcessor):
                 "current_draft": "",
                 "critique_notes": "",
                 "content_score": 0,
-                "loop_count": 0
+                "loop_count": 0,
+                "active_thread_id": thread_id,
             }
             token_queue = queue.Queue()
             self._human_approval_event = threading.Event()
             self._human_approval_state = {"value": None}
             self._tool_creation_event = threading.Event()
             self._tool_creation_state = {"value": None, "session_id": None}
-            config = {"configurable": {"system_prompt": adapter.system_prompt + HALLUCINATION_GUARD, "token_queue": token_queue, "approval_event": self._human_approval_event, "approval_state": self._human_approval_state, "tool_creation_event": self._tool_creation_event, "tool_creation_state": self._tool_creation_state, "tool_approved": True, "active_thread_id": self._active_thread_id, "session_id": "", "set_mode": self.set_mode, "rebuild_graph": self._rebuild_graph, "planner_llm_factory": self._make_planner_llm_factory(), "executor_llm_factory": self._make_executor_llm_factory()}}
+            self._plan_approval_event = threading.Event()
+            self._plan_approval_state = {"value": None}
+            self._file_edit_approval_event = threading.Event()
+            self._file_edit_approval_state = {"value": None}
+            self._file_edit_pending_tasks = {}
+            self._file_edit_pending_lock = threading.Lock()
+            self._file_edit_worker_stop = threading.Event()
+            self._file_edit_thread_id = thread_id
+            STAGING_REGISTRY.register_session(
+                thread_id,
+                approval_event=self._file_edit_approval_event,
+                approval_state=self._file_edit_approval_state,
+            )
+            config = {"configurable": {"system_prompt": adapter.system_prompt + HALLUCINATION_GUARD, "token_queue": token_queue, "approval_event": self._human_approval_event, "approval_state": self._human_approval_state, "plan_approval_event": self._plan_approval_event, "plan_approval_state": self._plan_approval_state, "tool_creation_event": self._tool_creation_event, "tool_creation_state": self._tool_creation_state, "file_edit_approval_event": self._file_edit_approval_event, "file_edit_approval_state": self._file_edit_approval_state, "file_edit_pending_tasks": self._file_edit_pending_tasks, "file_edit_pending_lock": self._file_edit_pending_lock, "tool_approved": True, "active_thread_id": self._active_thread_id, "session_id": "", "set_mode": self.set_mode, "rebuild_graph": self._rebuild_graph, "planner_llm_factory": self._make_planner_llm_factory(), "executor_llm_factory": self._make_executor_llm_factory()}}
+            worker_thread = threading.Thread(
+                target=self._file_edit_approval_worker,
+                daemon=True,
+                name="file-edit-approval-worker",
+            )
+            worker_thread.start()
             last_node_seen = "Unknown"
             accumulated_state = dict(input_state)
             def run_graph():
@@ -644,15 +663,6 @@ class Chatbot(ChatbotCommandProcessor):
                         active["messages"] = list(initial_messages) + new_ai
                     else:
                         active["messages"] = list(final_msgs)
-                # Compress long AI messages: save the full text into the
-                # thread's RAG store with FIFO eviction, then replace the
-                # in-memory content with a head+tail summary. ToolMessage
-                # results are kept verbatim so the LLM can see them on the
-                # next turn.
-                # This is run off the request thread (daemon) because the
-                # embedding call + FAISS update can take 2-3s on larger
-                # drafts; the RAG store is for future turns, not this one,
-                # so the GUI shouldn't block on it.
                 active_thread_id = active.get("id")
                 def _compress_and_save(messages_snapshot, thread_id):
                     for msg in messages_snapshot:
@@ -683,7 +693,115 @@ class Chatbot(ChatbotCommandProcessor):
             # Hardware debug header — prints to stdout (terminal). Safe in
             # this codebase because tkinter doesn't capture stdout.
             print(f"\n==== [VED HARDWARE DEBUG] ====\n  -> Request Mode: {self.mode.upper()}\n  -> Route completed: Node {last_node_seen}\n  -> RAM Active Models: {', '.join(ollama_active)}\n  -> Context size: {len(self._conversation_history)}\n==============================\n", flush=True)
+            self._file_edit_worker_stop.set()
+            worker_thread.join(timeout=2.0)
+            STAGING_REGISTRY.unregister_session(thread_id)
         return _stream_generator()
+
+    def _apply_file_edit_task(self, task: dict):
+        """Apply a single approved file-edit task by calling the underlying
+        filesystem action directly.
+
+        Returns the action's result string. Errors raised inside the
+        action are caught and returned as an "ERROR: ..." string so the
+        worker thread never crashes.
+        """
+        from graph.actions.filesystem import edit_file_action, overwrite_file_action
+        from pathlib import Path as _Path
+        tool_name = task.get("tool_name")
+        args = task.get("args") or {}
+        # _resolve_and_check uses PROJECT_ROOT as the sole allowed root
+        # in non-self-healing mode. Mirror the same boundary here so a
+        # post-approval apply cannot escape the project tree.
+        project_root = str(_Path(__file__).resolve().parent)
+        try:
+            if tool_name == "edit_file":
+                return edit_file_action(
+                    args.get("path", ""),
+                    args.get("old_text", ""),
+                    args.get("new_text", ""),
+                    allowed_roots=(project_root,),
+                    backup_dir=None,
+                )
+            elif tool_name == "overwrite_file":
+                return overwrite_file_action(
+                    args.get("path", ""),
+                    args.get("content", ""),
+                    allowed_roots=(project_root,),
+                    backup_dir=None,
+                )
+            return f"ERROR: unknown file-edit tool '{tool_name}'"
+        except Exception as exc:
+            return f"ERROR: {type(exc).__name__}: {exc}"
+
+    def _file_edit_approval_worker(self):
+        """Daemon worker: waits for file-edit approval events and applies
+        the approved subset of pending tasks.
+
+        Loop semantics:
+          - Exits when `self._file_edit_worker_stop` is set.
+          - Otherwise blocks on `self._file_edit_approval_event`.
+          - On wake, reads the decision dict from
+            `self._file_edit_approval_state["value"]` and applies it.
+          - Uses the staging registry when a session is registered; falls
+            back to the legacy in-memory dict for callers that bypass
+            `respond()` (e.g. unit tests).
+          - Then resets state and clears the event so the next decision
+            can be processed.
+        """
+        event = self._file_edit_approval_event
+        stop = self._file_edit_worker_stop
+        state = self._file_edit_approval_state
+        thread_id = getattr(self, "_file_edit_thread_id", "")
+        while not stop.is_set():
+            event.wait(timeout=0.2)
+            if stop.is_set():
+                break
+            if not event.is_set():
+                continue
+            decision = None
+            try:
+                decision = state.get("value") if state else None
+            except Exception:
+                decision = None
+            if thread_id and STAGING_REGISTRY.has_session(thread_id):
+                STAGING_REGISTRY.apply_decision(
+                    thread_id,
+                    decision or {},
+                    apply_callback=self._apply_file_edit_task,
+                )
+                with self._file_edit_pending_lock:
+                    self._file_edit_pending_tasks.clear()
+                    self._file_edit_pending_tasks.update(
+                        STAGING_REGISTRY.get_tasks(thread_id)
+                    )
+            else:
+                approved: list = []
+                with self._file_edit_pending_lock:
+                    snapshot = dict(self._file_edit_pending_tasks)
+                    action = (decision or {}).get("action", "reject")
+                    paths = (decision or {}).get("paths") or []
+                    if action == "approve_all":
+                        approved = list(snapshot.values())
+                        self._file_edit_pending_tasks.clear()
+                    elif action == "approve":
+                        for p in paths:
+                            t = snapshot.get(p)
+                            if t is not None:
+                                approved.append(t)
+                                self._file_edit_pending_tasks.pop(p, None)
+                    elif action == "reject_all":
+                        self._file_edit_pending_tasks.clear()
+                    else:
+                        for p in paths:
+                            self._file_edit_pending_tasks.pop(p, None)
+                for task in approved:
+                    self._apply_file_edit_task(task)
+            try:
+                state["value"] = None
+            except Exception:
+                pass
+            event.clear()
     
     def submit_human_approval(self, approved: bool) -> None:
         """Unblocks the content pipeline after it emits an approval_request event.
@@ -692,6 +810,42 @@ class Chatbot(ChatbotCommandProcessor):
         if state is not None:
             state["value"] = bool(approved)
         event = getattr(self, "_human_approval_event", None)
+        if event is not None:
+            event.set()
+
+    def submit_plan_approval(self, approved: bool) -> None:
+        """Unblocks the planner after it emits a plan_approval_request event.
+
+        Called by the UI when the user accepts or rejects the proposed plan.
+        Safe to call when no approval is pending (no-op).
+        """
+        state = getattr(self, "_plan_approval_state", None)
+        if state is not None:
+            state["value"] = bool(approved)
+        event = getattr(self, "_plan_approval_event", None)
+        if event is not None:
+            event.set()
+
+    def submit_file_edit_approval(self, decision) -> None:
+        """Unblocks the executor after it emits a file_edit_approval_request event.
+
+        Called by the UI when the user accepts or rejects a proposed file
+        edit (edit_file / overwrite_file). Safe to call when no approval
+        is pending (no-op).
+
+        `decision` may be:
+          - a bool (backward-compat): True -> approve_all, False -> reject_all.
+          - a dict {"action": "approve_all"|"reject_all"|"approve"|"reject",
+                    "paths": [..]} for per-file control.
+        """
+        if isinstance(decision, bool):
+            decision = {"action": "approve_all" if decision else "reject_all", "paths": []}
+        elif not isinstance(decision, dict):
+            decision = {"action": "reject_all", "paths": []}
+        state = getattr(self, "_file_edit_approval_state", None)
+        if state is not None:
+            state["value"] = decision
+        event = getattr(self, "_file_edit_approval_event", None)
         if event is not None:
             event.set()
 
@@ -710,11 +864,6 @@ class Chatbot(ChatbotCommandProcessor):
 
     def list_global_files(self) -> list:
         return self._global_files.list_uploads()
-
-    # ---- Per-thread pinning (metadata only) ----
-    # Pinned messages are marked with `additional_kwargs["pinned"] = True`.
-    # They live inside their own thread and never leak into other threads.
-    # The state.limit_messages reducer preserves them from being trimmed.
 
     def get_pinned_messages_in_active_thread(self) -> list:
         """Return the pinned messages in the current thread, oldest first."""

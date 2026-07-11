@@ -10,17 +10,10 @@ driven directly via the runnable config.
 import queue
 import sys
 import threading
-from pathlib import Path
-
 import pytest
-
 import graph.tools as tools_module
 import graph.tools.tool_creator as tc_module
-from graph.tools.tool_creator import (
-    _safe_filename,
-    _scan_blocked_imports,
-    propose_tool,
-)
+from graph.tools.tool_creator import _safe_filename, _scan_blocked_imports, propose_tool
 
 
 # ---- _safe_filename ----

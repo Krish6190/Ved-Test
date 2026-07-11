@@ -3,12 +3,18 @@
 Coder mode -> planner = qwen2.5-coder:7b, executor = llama3.2:3b.
 Standard/turbo -> both default to llama3.2:3b (or whatever `params["model"]` says).
 """
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
+import pytest
 from model_adapter import get_executor_llm, get_planner_llm
+
+
+@pytest.fixture(autouse=True)
+def _force_local_models(monkeypatch):
+    """Model-router tests exercise the local Ollama path and must not be
+    redirected to the cloud API even if .env has USE_CLOUD_API=true.
+    """
+    monkeypatch.setenv("USE_CLOUD_API", "false")
+    monkeypatch.delenv("API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_MODEL", raising=False)
 
 
 def test_coder_mode_splits_planner_and_executor_models():

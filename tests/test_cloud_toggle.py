@@ -3,14 +3,12 @@
 Verifies:
   - USE_CLOUD_API=false (default) -> ChatOllama is constructed
   - USE_CLOUD_API=true + API_KEY set -> ChatOpenAI pointed at OpenRouter,
-    with the Qwen 2.5 Coder 7B Instruct model by default
+    with the Poolside Laguna M.1 (free) coding model by default
   - USE_CLOUD_API=true + API_KEY missing -> falls back to ChatOllama
     with a warning (does NOT crash)
   - OPENROUTER_MODEL env var overrides the default model string
 """
-import os
 import warnings
-
 import pytest
 
 
@@ -53,7 +51,7 @@ def test_cloud_toggle_returns_chatopenai(clean_env):
     llm = _build()
     assert type(llm).__name__ == "ChatOpenAI", f"got {type(llm).__name__}"
     # ChatOpenAI exposes the model and base_url as attributes
-    assert "qwen-2.5-coder-7b-instruct" in llm.model_name, \
+    assert "poolside/laguna-m.1:free" in llm.model_name, \
         f"unexpected model: {llm.model_name}"
     assert "openrouter.ai" in str(llm.openai_api_base), \
         f"unexpected base_url: {llm.openai_api_base}"

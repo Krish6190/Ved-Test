@@ -6,8 +6,8 @@ running session are dynamically imported via `propose_tool`.
 """
 from __future__ import annotations
 import importlib
-from pathlib import Path
 from graph.tools._common import PROJECT_ROOT
+
 USER_TOOLS_DIR = PROJECT_ROOT / "graph" / "tools" / "user_tools"
 USER_TOOLS = []  # populated below; exposed for tests/introspection.
 

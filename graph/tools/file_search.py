@@ -33,6 +33,7 @@ from graph.tools._common import (
     is_safe_self_healing,
     last_user_message_text,
 )
+from graph.tools.staging_registry import STAGING_REGISTRY
 
 
 @tool
@@ -104,7 +105,20 @@ def search_files(
         return f"ERROR: No files matched '{pattern}' in '{base}'. Try a broader pattern."
 
     mode_tag = " [SELF-HEALING MODE]" if self_healing else ""
-    listing = "\n".join(matches)
+    # Annotate paths that have a pending staged edit in this session.
+    thread_id = getattr(state, "active_thread_id", "")
+    annotated = []
+    if thread_id and STAGING_REGISTRY.has_session(thread_id):
+        pending_paths = set(STAGING_REGISTRY.get_tasks(thread_id).keys())
+        for m in matches:
+            resolved = (base / m).resolve()
+            if str(resolved) in pending_paths:
+                annotated.append(f"{m}  [STAGED EDIT PENDING]")
+            else:
+                annotated.append(m)
+    else:
+        annotated = matches
+    listing = "\n".join(annotated)
     return (
         f"Found {len(matches)} match(es) for '{pattern}' in {base}{mode_tag}:\n"
         f"```\n{listing}\n```"

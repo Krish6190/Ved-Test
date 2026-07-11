@@ -18,16 +18,12 @@ in graph/actions/tool_creator_actions.py. This tool handles:
 Companion to: data/thread_files.py, graph/tools/_common.py.
 """
 from __future__ import annotations
-
 import ast
 import re
 import threading
-from pathlib import Path
 from typing import Annotated, List
-
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
-
 from graph.actions.tool_creator_actions import propose_tool_action, _register_into
 from graph.tools._common import PROJECT_ROOT
 
