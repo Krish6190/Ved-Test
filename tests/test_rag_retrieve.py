@@ -157,6 +157,27 @@ def test_retrieve_rag_handles_no_rag_stack(monkeypatch):
     assert "RAG stack unavailable" in result
 
 
+def test_retrieve_rag_fallback_uses_graph_rag_rag_db(monkeypatch):
+    """When thread retrieval is empty, fall back to the current package-level rag_db."""
+    import graph.rag as graph_rag
+
+    cfg = {"configurable": {"active_thread_id": "thr_x"}}
+    fake_rag_db = MagicMock()
+    fake_rag_db.query_similarity.return_value = [
+        {"source": "project.py", "content": "project chunk"},
+    ]
+    monkeypatch.setattr(graph_rag, "rag_db", fake_rag_db, raising=False)
+
+    with patch.object(rag_retrieve, "retrieve_context", return_value=[]), \
+         patch.object(rag_retrieve, "_format_rag_block", return_value=""):
+        result = _invoke_retrieve("project query", cfg=cfg, k=2)
+
+    assert "Retrieved 1 chunk" in result
+    fake_rag_db.query_similarity.assert_called_once_with(
+        "project query", k=2, scope="project"
+    )
+
+
 def test_truncate_helper():
     """Long strings get truncated with a marker; short ones pass through."""
     short = "x" * 100

@@ -23,6 +23,7 @@ data/vectordb/
 
 # Temporary test fixtures generated during pytest runs
 tests/.tmp/
+.tmp/
 
 # IDE / tooling directories
 .cursor/

@@ -37,6 +37,7 @@ from langchain_core.runnables import RunnableConfig
 
 from graph.state import VedState
 from graph.tools import PATH_A_EXECUTOR_TOOLS, _assert_tool_isolation
+from graph.nodes._stream_helpers import _clean_chunk
 
 
 # ---- Tunables ----
@@ -173,8 +174,11 @@ def standalone_chat_node(
         try:
             for chunk in llm_with_tools.stream(messages):
                 if hasattr(chunk, "content") and chunk.content:
-                    c = chunk.content if isinstance(chunk.content, str) else str(chunk.content)
-                    full_content += c
+                    raw = chunk.content if isinstance(chunk.content, str) else str(chunk.content)
+                    full_content += raw
+                    c = _clean_chunk(raw)
+                    if c is None:
+                        continue
                     if token_queue is not None:
                         try:
                             token_queue.put(c)

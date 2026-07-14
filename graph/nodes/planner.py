@@ -27,7 +27,7 @@ from langchain_core.runnables import RunnableConfig
 from data import plans as plan_store
 from graph.nodes._helpers import _build_rag_block
 from graph.nodes._hints import _FRESH_QUESTION_HINT
-from graph.nodes._stream_helpers import _stream_text
+from graph.nodes._stream_helpers import _stream_text, _clean_chunk
 from graph.nodes.planner_diagnostics import escalate, EscalationAction
 from graph.state import VedState
 from graph.tools.rag_retrieve import retrieve_rag
@@ -323,6 +323,28 @@ def _build_planner_prompt(state: VedState, plan: Optional[Dict[str, Any]], confi
     except Exception:
         pass
 
+    # Virtual sandbox injection: tell the Planner which files currently
+    # have staged edits in STAGING_REGISTRY. This prevents the Planner
+    # from re-reading the unchanged physical disk / raw RAG store and
+    # concluding that a chunk failed. It also lets the Planner advance
+    # to the next chunk instead of recreating the plan.
+    if active_thread_id:
+        try:
+            from graph.tools.staging_registry import STAGING_REGISTRY
+            staged_paths = sorted(
+                STAGING_REGISTRY.get_tasks(active_thread_id).keys()
+            )
+            if staged_paths:
+                msgs.append(SystemMessage(content=(
+                    "STAGED EDITS (awaiting user approval) — these files "
+                    "have been updated in memory but are NOT yet committed "
+                    "to disk. Treat them as complete for planning purposes; "
+                    "do not rewrite them unless the user explicitly asks:\n"
+                    + "\n".join(f"  - {p}" for p in staged_paths)
+                )))
+        except Exception:
+            pass
+
     # Task pin: when a plan is active, always include the original task
     # verbatim near the top. This survives history-clipping in long plans
     # so the planner never loses sight of what it's executing.
@@ -355,8 +377,16 @@ def _build_planner_prompt(state: VedState, plan: Optional[Dict[str, Any]], confi
             "  - DIRECT_ANSWER: <text>          if the task is simple\n"
         )))
     else:
-        chunks_done = [c for c in plan["chunks"] if c["status"] in ("done", "failed")]
+        # 'staged' chunks have had their edits stored in STAGING_REGISTRY
+        # but not yet committed to disk. They are complete from the
+        # executor's point of view and must NOT be re-executed. The
+        # planner should advance past them just like 'done' chunks.
+        chunks_done = [
+            c for c in plan["chunks"]
+            if c["status"] in ("done", "failed", "staged")
+        ]
         pending = [c for c in plan["chunks"] if c["status"] == "pending"]
+        staged = [c for c in plan["chunks"] if c["status"] == "staged"]
         progress_lines = []
         for c in plan["chunks"]:
             line = f"  [{c['id']}] {c['status'].upper():9} - {c['instruction'][:80]}"
@@ -376,11 +406,23 @@ def _build_planner_prompt(state: VedState, plan: Optional[Dict[str, Any]], confi
             )
         if pending:
             instruction = (
-                f"Continue the plan. {len(pending)} chunk(s) remain.\n\n"
+                f"Continue the plan. {len(pending)} chunk(s) remain. "
+                f"{len(staged)} chunk(s) are already staged in memory "
+                f"awaiting user approval.\n\n"
                 f"PLAN PROGRESS:\n{progress}{last_output_excerpt}\n\n"
                 f"You may call retrieve_rag to look up more context before "
                 f"deciding the next chunk's instruction. When ready, output "
                 f"EXECUTE_NEXT or FINAL_SUMMARY: <text>."
+            )
+        elif staged:
+            instruction = (
+                f"All chunks have been executed. {len(staged)} edit(s) are "
+                f"staged in memory awaiting user approval. Do NOT recreate "
+                f"the plan. Write a FINAL_SUMMARY that briefly describes "
+                f"what was done and notes that the edits are pending user "
+                f"approval.\n\n"
+                f"PLAN PROGRESS:\n{progress}{last_output_excerpt}\n\n"
+                f"Output FINAL_SUMMARY: <one paragraph wrap-up for the user>"
             )
         else:
             instruction = (
@@ -461,8 +503,11 @@ def _stream_with_tool_loop(llm, msgs, config, token_queue, max_rounds=_MAX_PLANN
         tool_calls_acc: Dict[int, Dict] = {}
         for chunk in llm.stream(msgs):
             if hasattr(chunk, "content") and chunk.content:
-                c = chunk.content if isinstance(chunk.content, str) else str(chunk.content)
-                full_content += c
+                raw = chunk.content if isinstance(chunk.content, str) else str(chunk.content)
+                full_content += raw
+                c = _clean_chunk(raw)
+                if c is None:
+                    continue
                 if token_queue:
                     try:
                         token_queue.put(c)
@@ -765,6 +810,9 @@ def planner_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
             updates["route_intent"] = "P_FINALIZE"
             plan_store.save_plan(plan)
         else:
+            # Preserve the current plan state when a previous chunk is
+            # already staged in memory; move straight to the next pending
+            # chunk so the executor doesn't loop back to the start.
             plan_store.mark_executing(plan, nxt["id"])
             plan_store.save_plan(plan)
             updates["current_chunk_id"] = nxt["id"]

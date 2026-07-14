@@ -21,17 +21,14 @@ Difference from the previous design:
 """
 from __future__ import annotations
 import json
+from pathlib import Path
 from typing import Any, Dict, List, Tuple
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from data import plans as plan_store
-# DEPRECATED: Kept for legacy fallback compatibility.
-# These actions are no longer invoked from executor.py (file-edit tools
-# now stage via the tool layer / STAGING_REGISTRY), but existing test
-# suites monkeypatch them as attributes of the executor module.
 from graph.actions.filesystem import edit_file_action, overwrite_file_action
 from graph.state import VedState
-from graph.nodes._stream_helpers import _stream_text
+from graph.nodes._stream_helpers import _stream_text, _clean_chunk
 from graph.tools import PATH_A_EXECUTOR_TOOLS, VED_TOOLS, _assert_tool_isolation
 from graph.tools.file_editor import overwrite_file, _resolve_and_check
 from graph.tools.file_reader import read_file
@@ -41,11 +38,9 @@ _PREVIEW_MAX_CHARS = 300
 _FILE_EDIT_TOOLS = frozenset({"edit_file", "overwrite_file"})
 
 
-# Tunables
 _MAX_AGENT_ITERATIONS = 8          # hard cap on LLM <-> tools round-trips per chunk
 _TOOL_RESULT_MAX_CHARS = 1500       # truncate tool output so chunks stay small
 
-# ---- Mode-aware tool notes (reused in executor_prompt) ----
 _TOOLS_NOTE_CODER = (
     "Available tools (full coder mode): read_file, edit_file, "
     "overwrite_file, search_files, execute_python, propose_tool, "
@@ -56,7 +51,6 @@ _TOOLS_NOTE_STANDARD = (
     "read_file, search_files, retrieve_rag, open_app."
 )
 
-# ---- File editing rules (injected into the executor prompt) ----
 _FILE_EDITING_RULES = (
     "FILE EDITING RULES (critical):\n"
     "- PREFER edit_file (FIM-style) over overwrite_file. edit_file replaces\n"
@@ -171,14 +165,29 @@ def _emit_file_edit_approval_request(token_queue, payload: dict) -> None:
     absolute file path) and immediately returns a pending result to the
     LLM. A daemon worker thread in `chatbot.py` waits on the approval
     event, applies approved edits, and discards rejected ones.
+
+    Defensive: if the token_queue handle is missing (e.g. a refactor
+    forgot to thread it through), the payload is still appended to
+    STAGING_REGISTRY so the UI worker can pick it up on the next
+    approval-decision callback. The review panel only fires when the
+    daemon worker applies a decision — without an event, the user would
+    never see the pending diffs.
     """
-    if token_queue is None:
-        return
+    if token_queue is not None:
+        try:
+            token_queue.put(("file_edit_approval_request", payload))
+        except Exception:
+            pass
     try:
-        token_queue.put(("file_edit_approval_request", payload))
+        tid = payload.get("thread_id") if isinstance(payload, dict) else None
+        tasks = payload.get("tasks") if isinstance(payload, dict) else None
+        if tid and tasks:
+            session = STAGING_REGISTRY._get_session(tid)  # noqa: SLF001
+            if session is not None:
+                with session.lock:
+                    session.tasks.update(tasks)
     except Exception:
         pass
-
 
 def _stream_one_iteration(llm_with_tools, messages, token_queue) -> Tuple[str, list]:
     """Stream one LLM turn. Returns (full_content, tool_calls_list).
@@ -190,8 +199,11 @@ def _stream_one_iteration(llm_with_tools, messages, token_queue) -> Tuple[str, l
     try:
         for chunk in llm_with_tools.stream(messages):
             if hasattr(chunk, "content") and chunk.content:
-                c = chunk.content if isinstance(chunk.content, str) else str(chunk.content)
-                full_content += c
+                raw = chunk.content if isinstance(chunk.content, str) else str(chunk.content)
+                full_content += raw
+                c = _clean_chunk(raw)
+                if c is None:
+                    continue
                 if token_queue is not None:
                     try:
                         token_queue.put(c)
@@ -272,9 +284,6 @@ def executor_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
         }
 
     if dual_phase == "execute":
-        # The Planner (Thinker) already produced a fix instruction. Run the
-        # Executor (Typist) prompt to turn it into an updated code block,
-        # then apply it with a file-modification tool (which stages the edit).
         fix_instruction = getattr(state, "fix_instruction", "")
         code_snippet = getattr(state, "target_file_content", "")
         target_path = getattr(state, "target_file_path", "")
@@ -313,8 +322,6 @@ def executor_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
                 "executor_generated_code": f"ERROR: {type(exc).__name__}: {exc}",
             }
         generated_code = _extract_code_block(full_content)
-        # Apply the generated code via overwrite_file so the whole snippet is
-        # replaced. The tool stages the change instead of writing disk.
         result = overwrite_file.invoke(
             {"path": target_path, "content": generated_code},
             config=config,
@@ -335,12 +342,6 @@ def executor_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
             "dual_role_phase": "stage",
             "executor_generated_code": generated_code,
         }
-
-    # Resolve the LLM for this executor call. Production (chatbot.py)
-    # injects a mode-aware `executor_llm_factory` closure into
-    # config["configurable"]; tests that don't bother with the factory
-    # fall back to the legacy `get_llm` callable parameter. Either way
-    # the executor gets a ChatOllama bound to the right model.
     factory = None
     if config and isinstance(config.get("configurable"), dict):
         factory = config["configurable"].get("executor_llm_factory")
@@ -354,11 +355,7 @@ def executor_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
             "route_intent": state.route_intent, "mode": state.mode,
         }
 
-    # Mode-aware tool set: full set for coder, restricted for standard.
     tools_to_bind = VED_TOOLS if state.mode == "coder" else PATH_A_EXECUTOR_TOOLS
-    # Defensive: catch any future refactor that accidentally leaks a
-    # coder-only tool into Path A's executor. Cheap (set intersection),
-    # loud (AssertionError with the leaked tool names).
     _assert_tool_isolation(state.mode, tools_to_bind)
     try:
         llm_with_tools = llm.bind_tools(tools_to_bind)
@@ -366,14 +363,8 @@ def executor_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
         _mark_failed_with_log(plan, chunk_id, f"setup: {type(exc).__name__}: {exc}", [])
         plan_store.save_plan(plan)
         return {"messages": [], "route_intent": state.route_intent, "mode": state.mode}
-
-    # Build tool lookup map (name -> BaseTool) for inline invocation.
     tool_map = {t.name: t for t in tools_to_bind}
-
-    # Mode-aware tool note for the executor's prompt
     tools_note = _TOOLS_NOTE_CODER if state.mode == "coder" else _TOOLS_NOTE_STANDARD
-
-    # Initial prompt for chunk N
     total = len(plan.get("chunks", []))
     done_count = sum(1 for c in plan["chunks"] if c["status"] in ("done", "failed", "skipped"))
     executor_prompt = HumanMessage(content=(
@@ -387,10 +378,6 @@ def executor_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
         "give a concise summary of what you did and what you observed.\n\n"
         f"{_FILE_EDITING_RULES}"
     ))
-    # Surface planner-captured context_blocks as read-only background.
-    # The "not instructions" wording is intentional: a context block
-    # from project RAG must not be able to redirect the executor with
-    # prompt-injection-style payloads.
     messages: list = []
     context_blocks = chunk.get("context_blocks") or []
     if context_blocks:
@@ -405,16 +392,7 @@ def executor_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
         token_queue = config["configurable"]["token_queue"]
     except (KeyError, TypeError):
         token_queue = None
-
-    # File-edit staging: the tool layer (graph.tools.file_editor) handles
-    # registry-based staging when a session is active. For backward
-    # compatibility with callers that wire the legacy in-memory approval
-    # infrastructure directly into config, the executor also intercepts
-    # edit_file / overwrite_file calls and populates the legacy dict.
     thread_id = getattr(state, "active_thread_id", "")
-
-    # Legacy approval infra (opt-in). When present, intercept file edits
-    # so the existing test suite and direct callers keep working.
     file_edit_approval_event = None
     file_edit_approval_state = None
     file_edit_pending_tasks = None
@@ -434,13 +412,23 @@ def executor_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
         and isinstance(file_edit_pending_tasks, dict)
         and file_edit_pending_lock is not None
     )
-
-    # === Agent loop ===
     structured_log: List[Dict[str, Any]] = []
     last_content = ""
     last_error: str = ""
     failed_tool_name: str = ""
     stopped_reason: str = ""
+    file_edit_tools_called: set = set()
+    read_files_called: set = set()
+    staged_a_file_edit = False
+    chunk_instruction_lower = (chunk.get("instruction") or "").lower()
+    _MODIFY_KEYWORDS = (
+        "edit", "fix", "modify", "change", "update", "refactor",
+        "rename", "replace", "rewrite", "remove", "delete", "add",
+        "patch", "correct", "implement",
+    )
+    chunk_requires_modification = any(
+        kw in chunk_instruction_lower for kw in _MODIFY_KEYWORDS
+    )
 
     for iteration in range(_MAX_AGENT_ITERATIONS):
         try:
@@ -452,20 +440,20 @@ def executor_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
             last_error = f"stream: {type(exc).__name__}: {exc}"
             stopped_reason = "stream_exception"
             break
-
-        # No tool calls -> LLM is done.
         if not tool_calls_list:
             stopped_reason = "done"
             break
-
-        # Build the AI message to append to the conversation history.
         ai_msg = AIMessage(content=content, tool_calls=tool_calls_list)
         messages.append(ai_msg)
-
-        # Execute each tool call inline. Stop at first error.
         tool_messages = []
         any_error = False
+        saw_read_file_this_round = False
         for tc in tool_calls_list:
+            if tc["name"] in _FILE_EDIT_TOOLS:
+                file_edit_tools_called.add(tc["name"])
+            if tc["name"] == "read_file":
+                read_files_called.add(tc["name"])
+                saw_read_file_this_round = True
             tool = tool_map.get(tc["name"])
             if tool is None:
                 error_msg = f"unknown tool '{tc['name']}'"
@@ -477,11 +465,6 @@ def executor_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
                 failed_tool_name = tc["name"]
                 any_error = True
                 break
-
-            # Legacy interception path: when the caller wired the in-memory
-            # approval infrastructure into config, stage the edit directly
-            # without invoking the tool. This preserves the existing unit
-            # tests and direct API callers.
             if tc["name"] in _FILE_EDIT_TOOLS and has_approval_infra:
                 self_healing = bool(getattr(state, "self_healing", False))
                 path_str = tc["args"].get("path", "") or ""
@@ -492,13 +475,18 @@ def executor_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
                         resolved_path = str(resolved)
                 except Exception:
                     resolved_path = path_str
+                try:
+                    resolved_path = str(Path(resolved_path).resolve()) if resolved_path else resolved_path
+                except Exception:
+                    resolved_path = str(resolved_path)
+                task_path = path_str or resolved_path
                 tool_name = tc["name"]
                 args_copy = dict(tc["args"])
                 if "path" in args_copy:
-                    args_copy["path"] = resolved_path
+                    args_copy["path"] = task_path
                 task = {
                     "tool_name": tool_name,
-                    "path": resolved_path,
+                    "path": task_path,
                     "args": args_copy,
                     "self_healing": self_healing,
                     "preview": {
@@ -511,24 +499,27 @@ def executor_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
                     },
                 }
                 with file_edit_pending_lock:
-                    file_edit_pending_tasks[resolved_path] = task
+                    file_edit_pending_tasks[task_path] = task
+                if thread_id and STAGING_REGISTRY.has_session(thread_id):
+                    try:
+                        with STAGING_REGISTRY._get_session(thread_id).lock:  # noqa: SLF001
+                            STAGING_REGISTRY._get_session(thread_id).tasks[task_path] = task  # noqa: SLF001
+                    except Exception:
+                        pass
                 payload = {
-                    "path": resolved_path,
+                    "path": task_path,
                     "operation": "edit" if tool_name == "edit_file" else "overwrite",
                     "preview": task["preview"],
                     "tasks": dict(file_edit_pending_tasks),
+                    "thread_id": thread_id,
                 }
                 _emit_file_edit_approval_request(token_queue, payload)
-                try:
-                    file_edit_approval_state["value"] = None
-                    file_edit_approval_event.set()
-                except Exception:
-                    pass
                 result_text = (
                     f"Pending approval: {tool_name} on {resolved_path}. "
                     f"Awaiting user decision in the file-edit review panel."
                 )
                 ok = True
+                staged_a_file_edit = True
             elif tc["name"] == "read_file" and has_approval_infra:
                 # Legacy read overlay using the in-memory pending dict.
                 result_text, ok = _invoke_tool_sync(tool, tc["args"])
@@ -543,6 +534,7 @@ def executor_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
                                 resolved_path = str(resolved)
                         except Exception:
                             resolved_path = path_str
+                        resolved_path = str(Path(resolved_path).resolve()) if resolved_path else resolved_path
                         result_text = _apply_pending_read_overlay(
                             resolved_path, result_text,
                             file_edit_pending_tasks,
@@ -552,9 +544,6 @@ def executor_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
                         pass
             else:
                 result_text, ok = _invoke_tool_sync(tool, tc["args"])
-            # Registry staging path: if the tool itself staged the edit
-            # (active session via STAGING_REGISTRY), surface the cumulative
-            # review panel to the UI.
             if ok and isinstance(result_text, str) and result_text.startswith("STAGED:"):
                 path_str = tc["args"].get("path", "") or ""
                 operation = "edit" if tc["name"] == "edit_file" else "overwrite"
@@ -577,6 +566,7 @@ def executor_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
                     "tasks": dict(tasks),
                 }
                 _emit_file_edit_approval_request(token_queue, payload)
+                staged_a_file_edit = True
             # Defensive truncation: even if _invoke_tool_sync didn't
             # truncate, cap the result here so chunk.tool_calls stays small.
             if len(result_text) > _TOOL_RESULT_MAX_CHARS:
@@ -603,6 +593,32 @@ def executor_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
             break
 
         messages.extend(tool_messages)
+        if saw_read_file_this_round and not file_edit_tools_called:
+            messages.append(SystemMessage(content=(
+                "MANDATORY NEXT STEP: You just read the file. You MUST now "
+                "call edit_file (preferred) or overwrite_file to actually "
+                "apply the fix described in your chunk instruction. Do NOT "
+                "respond with a summary, do NOT call FINAL_SUMMARY, do NOT "
+                "emit conversational text. The next tool call MUST be "
+                "edit_file or overwrite_file with concrete old_text/new_text "
+                "or path/content arguments."
+            )))
+    if (
+        not last_error
+        and read_files_called
+        and chunk_requires_modification
+        and not file_edit_tools_called
+    ):
+        last_error = (
+            "Executor read the target file but never called edit_file or "
+            "overwrite_file. The chunk instruction asks for a code "
+            "modification, so this is a hallucinated short-circuit \u2014 "
+            "the planner must retry with an instruction that explicitly "
+            "requires an edit_file (preferred) or overwrite_file call "
+            "before the chunk is allowed to complete."
+        )
+        failed_tool_name = "edit_file"
+        stopped_reason = "no_edit_tool_called"
 
     # Compute the new retry count for this chunk. The planner reads this
     # to decide whether to escalate (retry_count >= 4 triggers hard halt).
@@ -634,6 +650,22 @@ def executor_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
                     }))
                 except Exception:
                     pass
+        elif staged_a_file_edit:
+            plan_store.mark_staged(plan, chunk_id)
+            success_messages = [AIMessage(content=output_text)]
+            nxt = plan_store.next_pending(plan)
+            if nxt is None:
+                plan_store.set_waiting(plan, "Awaiting user approval of staged edits")
+            else:
+                plan_store.mark_executing(plan, nxt["id"])
+            if token_queue is not None:
+                try:
+                    token_queue.put(("plan_update", {
+                        "event": "chunk_staged",
+                        "chunk_id": chunk_id,
+                    }))
+                except Exception:
+                    pass
         else:
             plan_store.mark_done(plan, chunk_id, output_text, tool_calls=structured_log)
             # Surface the chunk result as an AIMessage so the user sees it.
@@ -654,7 +686,6 @@ def executor_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
         "mode": state.mode,
         "chunk_retry_count": new_retry_count,
     }
-
 
 def _mark_failed_with_log(
     plan: Dict[str, Any],

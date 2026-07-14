@@ -22,11 +22,6 @@ from langchain_core.tools import tool
 
 
 _MAX_CHARS_PER_CHUNK = 1500  # truncate retrieved chunks for prompt size
-
-
-# Module-level references to the lazy-loaded RAG functions. Tests can patch
-# these directly. Set to None if the imports below fail (e.g., embedding
-# pipeline unavailable in this environment).
 retrieve_context = None  # type: ignore[assignment]
 _format_rag_block = None  # type: ignore[assignment]
 _rag_import_error: Optional[str] = None
@@ -91,11 +86,6 @@ def retrieve_rag(
         chunks = retrieve_context(query.strip(), thread_id, k=max(1, min(k, 20)))
     except Exception as exc:
         return f"ERROR: retrieve_rag failed: {exc}"
-
-    # Resolve the caller's mode from config (same place active_thread_id comes
-    # from). Falls back to empty string if config doesn't carry it, which
-    # disables the project fallback — Path A's chat calls never have mode
-    # in their config so they correctly lose the project scope here.
     caller_mode = ""
     if config:
         try:
@@ -103,14 +93,12 @@ def retrieve_rag(
             caller_mode = (conf.get("state_mode") or conf.get("mode") or "").lower()
         except Exception:
             pass
-
-    # Project-scope fallback: ONLY for coder mode. Path A (standard/turbo)
-    # keeps retrieve_rag for thread-scoped past-chat memory but does NOT
-    # fall back to the project indexer — codebase discovery in Path A goes
-    # through search_files / read_file instead.
-    if not chunks and thread_id and caller_mode == "coder":
+    if not chunks and thread_id:
         try:
-            from graph.rag.rag_db import rag_db  # the LocalVectorDB instance
+            from graph import rag as rag_package
+            rag_db = getattr(rag_package, "rag_db", None)
+            if rag_db is None:
+                raise AttributeError("graph.rag.rag_db is unavailable")
             project_results = rag_db.query_similarity(
                 query.strip(), k=max(1, min(k, 20)), scope="project",
             ) or []
@@ -154,10 +142,20 @@ def retrieve_rag(
             suffix += f" (layer={layer})"
         if paths:
             suffix += f" (paths={paths})"
+        # Empty result is a critical signal: NEVER let the model guess or
+        # claim the task is already done based on chat history. Force an
+        # immediate filesystem read by referencing the available tools
+        # (read_file / search_files) directly so the LLM sees the actual
+        # file contents before answering.
         return (
             f"No RAG chunks found matching '{query}'"
             + (f" in thread {thread_id[:8]}" if thread_id else ".")
             + suffix
+            + "\n\nFALLBACK REQUIRED: RAG is empty for this query. You MUST "
+              "NOT guess or claim the task is already completed based on "
+              "prior chat history. Immediately call a filesystem tool "
+              "(read_file or search_files) to read the actual files from "
+              "disk before answering."
         )
 
     # Format the chunks. Reuse the project standard formatter so the LLM sees

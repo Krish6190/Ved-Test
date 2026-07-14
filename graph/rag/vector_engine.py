@@ -73,7 +73,7 @@ class LocalVectorDB:
         except Exception as e:
             print(f"[RAG Engine] Disk write warning: {e}")
 
-    def ingest_local_file(self, file_path: str, scope: str = GLOBAL_SCOPE, chunker: str = "text", source: str | None = None):
+    def ingest_local_file(self, file_path: str, scope: str = GLOBAL_SCOPE, chunker: str = "text", source: str | None = None) -> bool:
         """Read a local file and ingest its chunks into the vector DB.
 
         Args:
@@ -85,32 +85,65 @@ class LocalVectorDB:
             source: Registry `source` label stored on every chunk. If None, we
                 fall back to os.path.basename(file_path). Callers should pass an
                 explicit basename so delete_by_source can evict by source later.
+
+        Returns:
+            True if at least one new chunk was successfully committed to the
+            vector DB, False otherwise (file unreadable, chunker failed with
+            no fallback available, embedding failed, or the file was already
+            fully indexed).
+
+        Robustness: when the requested chunker fails (e.g. AST chunker hits
+        a syntax error on a non-Python file or a syntax-invalid snippet),
+        we transparently fall back to the text chunker so the file still
+        gets indexed. Previously the AST path returned silently with
+        zero chunks committed, and `index_workspace` marked the file as
+        indexed anyway -- producing an empty RAG result for that file.
         """
+        records: list = []
+        ast_failed = False
+
         if chunker == "ast":
             try:
-                from graph.rag.code_chunker import chunk_file
+                import importlib.util
+                import pathlib
+                module_path = pathlib.Path(__file__).resolve().parent / "code_chunker.py"
+                spec = importlib.util.spec_from_file_location("ved_ast_chunker", module_path)
+                if spec is None or spec.loader is None:
+                    raise ImportError(f"Could not load chunker spec from {module_path}")
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                chunk_file = getattr(module, "chunk_file")
                 raw_chunks = chunk_file(file_path)
             except Exception as e:
-                print(f"[RAG Engine] AST chunking failed for {file_path}: {e}")
-                return
-            records = []
-            for c in raw_chunks:
-                content = (c.get("content") or "").strip()
-                if not content:
-                    continue
-                records.append({
-                    "content": content,
-                    "source": source if source is not None else os.path.basename(file_path),
-                    "scope": scope,
-                    "chunker": "ast",
-                    "layer": c.get("layer", "body"),
-                    "name": c.get("name", ""),
-                    "lineno": int(c.get("lineno", 0) or 0),
-                    "end_lineno": int(c.get("end_lineno", 0) or 0),
-                })
-        else:
-            chunks = self.file_parser.process_file_to_chunks(file_path)
-            records = []
+                print(f"[RAG Engine] AST chunking failed for {file_path}: {e}; falling back to text chunker")
+                ast_failed = True
+                raw_chunks = None
+            if raw_chunks is not None:
+                for c in raw_chunks:
+                    content = (c.get("content") or "").strip()
+                    if not content:
+                        continue
+                    records.append({
+                        "content": content,
+                        "source": source if source is not None else os.path.basename(file_path),
+                        "scope": scope,
+                        "chunker": "ast",
+                        "layer": c.get("layer", "body"),
+                        "name": c.get("name", ""),
+                        "lineno": int(c.get("lineno", 0) or 0),
+                        "end_lineno": int(c.get("end_lineno", 0) or 0),
+                    })
+
+        # Fall back to text chunker when AST failed or produced zero
+        # records. We also fall back if AST succeeded but yielded nothing
+        # (e.g. an empty source file with only docstrings/comments that
+        # the AST layer dropped).
+        if (chunker == "ast" and (ast_failed or not records)) or chunker == "text":
+            try:
+                chunks = self.file_parser.process_file_to_chunks(file_path)
+            except Exception as e:
+                print(f"[RAG Engine] Text chunking failed for {file_path}: {e}")
+                chunks = []
             for c in chunks:
                 content = c.strip()
                 if not content:
@@ -127,26 +160,35 @@ class LocalVectorDB:
                 })
 
         if not records:
-            return
+            print(f"[RAG Engine] No chunks produced for {file_path}; skipping commit")
+            return False
         existing_contents = {record["content"] for record in self.registry}
         records_to_embed = [r for r in records if r["content"] not in existing_contents]
         if not records_to_embed:
-            return
+            return False
         try:
             vectors = self.embeddings_engine.embed_documents([r["content"] for r in records_to_embed])
-            new_entries = []
-            new_vectors = []
-            for rec, vec in zip(records_to_embed, vectors):
-                if vec:
-                    new_entries.append(rec)
-                    new_vectors.append(vec)
-            if new_entries:
-                new_v_arr = np.array(new_vectors, dtype=np.float32)
-                self.vectors_matrix = np.vstack([self.vectors_matrix, new_v_arr]) if self.vectors_matrix is not None else new_v_arr
-                self.registry.extend(new_entries)
-                self._save_database()
         except Exception as e:
-            print(f"[RAG Engine] Batch vector processing exception: {e}")
+            print(f"[RAG Engine] Batch vector processing exception for {file_path}: {e}")
+            return False
+        new_entries = []
+        new_vectors = []
+        for rec, vec in zip(records_to_embed, vectors):
+            if vec:
+                new_entries.append(rec)
+                new_vectors.append(vec)
+        if not new_entries:
+            print(f"[RAG Engine] Embedder returned no usable vectors for {file_path}")
+            return False
+        new_v_arr = np.array(new_vectors, dtype=np.float32)
+        self.vectors_matrix = np.vstack([self.vectors_matrix, new_v_arr]) if self.vectors_matrix is not None else new_v_arr
+        self.registry.extend(new_entries)
+        try:
+            self._save_database()
+        except Exception as e:
+            print(f"[RAG Engine] Disk write failed for {file_path}: {e}")
+            return False
+        return True
 
     def ingest_text(self, text: str, scope: str = GLOBAL_SCOPE, source: str = "raw_text", chunker: str = "text"):
         """Embed raw text into the vector DB without going through the disk path.

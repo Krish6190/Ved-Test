@@ -2,11 +2,6 @@ import os
 import re
 from pathlib import Path
 
-# Load .env so os.getenv("API_KEY"), USE_CLOUD_API, OPENROUTER_MODEL, etc.
-# work without requiring the user to export them in their shell. Mirrors
-# voice/voice_module.py's pattern. Best-effort: if python-dotenv isn't
-# installed, fall back to a minimal built-in loader.
-
 def _load_env_fallback() -> None:
     """Minimal .env loader used only if python-dotenv is unavailable.
 
@@ -102,19 +97,27 @@ def _resolve_model_name(mode: str, *, modelfile_dir: str = ".") -> str:
     return "llama3.2:3b"
 
 
+def _local_ollama_available(base_url: str) -> bool:
+    """Return True if a local Ollama server is reachable at `base_url`."""
+    try:
+        import requests
+        endpoint = base_url.rstrip("/") + "/api/ls"
+        resp = requests.get(endpoint, timeout=2)
+        return resp.status_code == 200
+    except Exception:
+        return False
+
+
 def _build_ollama_llm(model_name: str, *, base_url: str, device: str, params: dict):
     """Construct a ChatOllama with the same kwargs layout as
     ModelAdapter.create_llm — keeps temperature, keep_alive, and
     num_gpu handling consistent across the codebase."""
-    # ---- Cloud API toggle (USE_CLOUD_API=true routes to OpenRouter) ----
-    # When enabled, skip local Ollama entirely and return a ChatOpenAI
-    # pointed at OpenRouter's OpenAI-compatible endpoint. The Qwen
-    # 2.5 Coder 7B Instruct model served via OpenRouter is the same
-    # model we run locally (Modelfile.coder), so prompts, tool calls,
-    # and the planner/executor chunk pipeline work without changes.
     if os.getenv("USE_CLOUD_API", "").lower() in ("1", "true", "yes"):
+        local_available = _local_ollama_available(base_url)
         api_key = os.getenv("API_KEY")
-        if not api_key:
+        if local_available:
+            pass
+        elif not api_key:
             import warnings
             warnings.warn(
                 "USE_CLOUD_API=true but no API_KEY set in environment; "
@@ -138,7 +141,7 @@ def _build_ollama_llm(model_name: str, *, base_url: str, device: str, params: di
                 base_url="https://openrouter.ai/api/v1",
                 temperature=temperature,
             )
-
+ 
     try:
         from langchain_ollama import ChatOllama
     except ImportError as exc:

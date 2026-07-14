@@ -632,8 +632,21 @@ class Chatbot(ChatbotCommandProcessor):
                     for chunk in self._graph.stream(input_state, config=config, stream_mode="updates"):
                         for node_name, node_output in chunk.items():
                             last_node_seen = node_name
+                            # Merge node outputs into the accumulated state.
+                            # Protect against duplicate FINAL_SUMMARY emissions
+                            # by honoring `summary_emitted` in the thread-local
+                            # accumulated_state. Once a final summary has been
+                            # recorded, subsequent attempts to set
+                            # 'final_summary' are ignored.
                             for key, val in node_output.items():
-                                accumulated_state[key] = val
+                                if key == "final_summary":
+                                    if accumulated_state.get("summary_emitted"):
+                                        # skip duplicate final summary
+                                        continue
+                                    accumulated_state["summary_emitted"] = True
+                                    accumulated_state["final_summary"] = val
+                                else:
+                                    accumulated_state[key] = val
                 except Exception as exc:
                     token_queue.put(("error", str(exc)))
                 finally:
@@ -746,6 +759,8 @@ class Chatbot(ChatbotCommandProcessor):
           - Uses the staging registry when a session is registered; falls
             back to the legacy in-memory dict for callers that bypass
             `respond()` (e.g. unit tests).
+          - Updates the active plan's chunk statuses so that staged edits
+            become "done" on approval or "pending" on rejection.
           - Then resets state and clears the event so the next decision
             can be processed.
         """
@@ -764,6 +779,33 @@ class Chatbot(ChatbotCommandProcessor):
                 decision = state.get("value") if state else None
             except Exception:
                 decision = None
+            if decision is None:
+                try:
+                    event.clear()
+                except Exception:
+                    pass
+                continue
+            action = (decision or {}).get("action", "reject")
+            paths = (decision or {}).get("paths") or []
+
+            # Update the active plan's chunk statuses before/after applying
+            # the decision so the Planner sees the correct state on its
+            # next turn (done on approval, pending on rejection).
+            try:
+                from data import plans as _plan_store
+                plan_id = getattr(self, "_active_plan_id", None)
+                if plan_id:
+                    plan = _plan_store.load_plan(plan_id)
+                    if plan:
+                        if action in ("approve", "approve_all"):
+                            _plan_store.finalize_staged(plan)
+                            _plan_store.finalize(plan, plan.get("summary", ""))
+                        else:
+                            _plan_store.resume_staged_to_pending(plan)
+                        _plan_store.save_plan(plan)
+            except Exception:
+                pass
+
             if thread_id and STAGING_REGISTRY.has_session(thread_id):
                 STAGING_REGISTRY.apply_decision(
                     thread_id,
@@ -779,8 +821,6 @@ class Chatbot(ChatbotCommandProcessor):
                 approved: list = []
                 with self._file_edit_pending_lock:
                     snapshot = dict(self._file_edit_pending_tasks)
-                    action = (decision or {}).get("action", "reject")
-                    paths = (decision or {}).get("paths") or []
                     if action == "approve_all":
                         approved = list(snapshot.values())
                         self._file_edit_pending_tasks.clear()
@@ -837,11 +877,69 @@ class Chatbot(ChatbotCommandProcessor):
           - a bool (backward-compat): True -> approve_all, False -> reject_all.
           - a dict {"action": "approve_all"|"reject_all"|"approve"|"reject",
                     "paths": [..]} for per-file control.
+
+        Decision context tracking:
+          - Rejections immediately remove the rejected paths from the
+            STAGING_REGISTRY queue AND append an invisible SystemMessage
+            to the active thread so the Planner remembers not to retry
+            the same edit on the next turn.
+          - Approvals rely on the worker thread to write to disk; no
+            system message is needed because the Planner's read_file
+            tools will see the updated file contents next turn.
         """
         if isinstance(decision, bool):
             decision = {"action": "approve_all" if decision else "reject_all", "paths": []}
         elif not isinstance(decision, dict):
             decision = {"action": "reject_all", "paths": []}
+        else:
+            paths = decision.get("paths")
+            if paths is None:
+                decision["paths"] = []
+            elif not isinstance(paths, list):
+                decision["paths"] = list(paths)
+
+        action = decision.get("action", "")
+        paths = decision.get("paths") or []
+        thread_id = getattr(self, "_file_edit_thread_id", "")
+
+        # --- Decision context tracking for rejections ---
+        # Rejections must be remembered by the Planner across turns. Drop
+        # the rejected files from STAGING_REGISTRY immediately and inject
+        # an invisible SystemMessage into the active thread history so the
+        # model does not hallucinate the same rejected edit again.
+        if action in ("reject", "reject_all"):
+            rejected_paths = list(paths) if action == "reject" else []
+            if action == "reject_all" and thread_id:
+                try:
+                    rejected_paths = list(STAGING_REGISTRY.get_tasks(thread_id).keys())
+                except Exception:
+                    rejected_paths = []
+            # Drop from STAGING_REGISTRY so the worker will not try to
+            # apply (or re-emit) these rejected tasks.
+            if thread_id:
+                try:
+                    STAGING_REGISTRY.apply_decision(
+                        thread_id,
+                        {"action": action, "paths": rejected_paths},
+                        apply_callback=lambda task: "rejected",
+                    )
+                except Exception:
+                    pass
+            # Record the rejection in conversation history for the Planner.
+            if rejected_paths:
+                try:
+                    active = self.get_active_thread()
+                    for path in rejected_paths:
+                        active["messages"].append(SystemMessage(content=(
+                            f"System: The user rejected your proposed edits for "
+                            f"{path}. Do not attempt this specific modification "
+                            f"again. Please analyze the repository state and "
+                            f"generate an alternative solution if requested."
+                        )))
+                    self._save_threads()
+                except Exception:
+                    pass
+
         state = getattr(self, "_file_edit_approval_state", None)
         if state is not None:
             state["value"] = decision

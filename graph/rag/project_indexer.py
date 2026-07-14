@@ -295,14 +295,25 @@ def index_workspace(
             if not force and index.get(rel_path) == file_hash:
                 stats["files_skipped"] += 1
                 continue
-
-            # Ingest into RAG store
             try:
-                db.ingest_local_file(str(full_path), scope=_PROJECT_SCOPE, chunker="ast", source=os.path.basename(full_path))
-                index[rel_path] = file_hash
-                stats["files_indexed"] += 1
+                committed = db.ingest_local_file(
+                    str(full_path),
+                    scope=_PROJECT_SCOPE,
+                    chunker="ast",
+                    source=os.path.basename(full_path),
+                )
             except Exception as e:
                 print(f"[project_indexer] Failed to index {rel_path}: {e}")
+                stats["errors"] += 1
+                committed = False
+            if committed:
+                index[rel_path] = file_hash
+                stats["files_indexed"] += 1
+            else:
+                # No chunks committed -- do NOT add to the hash index so
+                # the next session retries. Count as a transient error
+                # so the stats surface the issue.
+                print(f"[project_indexer] No chunks committed for {rel_path}; will retry next session")
                 stats["errors"] += 1
 
             if progress_callback is not None:

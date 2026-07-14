@@ -23,6 +23,7 @@ import graph.actions.filesystem as fs_actions
 import graph.nodes.executor as executor_mod
 import graph.tools.file_reader as file_reader_mod
 import graph.tools.file_search as file_search_mod
+from graph.tools.staging_registry import STAGING_REGISTRY
 
 
 # ---- helpers ----
@@ -306,12 +307,12 @@ def test_worker_approve_all_applies_all_edits(tmp_path, monkeypatch):
     """approve_all should apply every pending task and clear the queue."""
     _bypass_safety(monkeypatch)
     from chatbot import Chatbot
-
+ 
     target_a = tmp_path / "a.py"
     target_b = tmp_path / "b.py"
     target_a.write_text("a\n", encoding="utf-8")
     target_b.write_text("b\n", encoding="utf-8")
-
+ 
     chatbot = Chatbot.__new__(Chatbot)
     chatbot._file_edit_pending_tasks = {
         str(target_a): {
@@ -330,13 +331,51 @@ def test_worker_approve_all_applies_all_edits(tmp_path, monkeypatch):
     chatbot._file_edit_pending_lock = threading.Lock()
     chatbot._file_edit_approval_event = threading.Event()
     chatbot._file_edit_approval_state = {"value": None}
-
+ 
     _run_worker_once(chatbot, {"action": "approve_all", "paths": []})
-
+ 
     assert target_a.read_text(encoding="utf-8") == "A\n"
     assert target_b.read_text(encoding="utf-8") == "B\n"
     with chatbot._file_edit_pending_lock:
         assert chatbot._file_edit_pending_tasks == {}
+ 
+def test_worker_approve_all_applies_all_edits_via_staging_registry(tmp_path, monkeypatch):
+    """approve_all should apply staged edits from STAGING_REGISTRY and clear the overlay."""
+    _bypass_safety(monkeypatch)
+    from chatbot import Chatbot
+ 
+    thread_id = "thr_staging_approve_all"
+    target = tmp_path / "a.py"
+    target.write_text("a\n", encoding="utf-8")
+    event = threading.Event()
+    state = {"value": None}
+    STAGING_REGISTRY.register_session(thread_id, approval_event=event, approval_state=state)
+    STAGING_REGISTRY.stage_edit(
+        thread_id,
+        "edit_file",
+        str(target),
+        {"path": str(target), "old_text": "a", "new_text": "A"},
+        {"old": "a", "new": "A"},
+    )
+ 
+    chatbot = Chatbot.__new__(Chatbot)
+    chatbot._file_edit_thread_id = thread_id
+    chatbot._file_edit_pending_tasks = {}
+    chatbot._file_edit_pending_lock = threading.Lock()
+    chatbot._file_edit_approval_event = event
+    chatbot._file_edit_approval_state = state
+    chatbot._file_edit_worker_stop = threading.Event()
+ 
+    worker = threading.Thread(target=chatbot._file_edit_approval_worker, daemon=True)
+    worker.start()
+    chatbot.submit_file_edit_approval({"action": "approve_all", "paths": []})
+    time.sleep(0.3)
+    chatbot._file_edit_worker_stop.set()
+    worker.join(timeout=1.0)
+ 
+    assert target.read_text(encoding="utf-8") == "A\n"
+    assert STAGING_REGISTRY.get_tasks(thread_id) == {}
+    STAGING_REGISTRY.unregister_session(thread_id)
 
 
 # ---- 6. Worker reject-all drops every queued edit ----

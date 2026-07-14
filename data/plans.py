@@ -201,6 +201,10 @@ def next_pending(plan: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return None
 
 
+def has_staged_chunks(plan: Dict[str, Any]) -> bool:
+    return any(c.get("status") == "staged" for c in plan.get("chunks", []))
+
+
 def finalize(plan: Dict[str, Any], summary: str) -> Dict[str, Any]:
     plan["status"] = "complete"
     plan["final_summary"] = summary
@@ -411,6 +415,58 @@ def skip_chunk(plan: Dict[str, Any], chunk_id: int, reason: str = "") -> Dict[st
     raise KeyError(f"No chunk with id={chunk_id} in plan {plan.get('plan_id')}")
 
 
+def mark_staged(plan: Dict[str, Any], chunk_id: int) -> Dict[str, Any]:
+    """Mark a chunk as staged_in_memory.
+
+    Used by the batch executor when a chunk's edits have been staged in
+    STAGING_REGISTRY but not yet committed to disk. Staged chunks are
+    skipped on subsequent executor sweeps; the planner treats them as
+    awaiting user approval. Once approved, staged chunks transition to
+    'done'.
+    """
+    for c in plan.get("chunks", []):
+        if c["id"] == chunk_id:
+            c["status"] = "staged"
+            c["output"] = c.get("output") or "STAGED: awaiting user approval"
+            c["executed_at"] = c.get("executed_at") or time.time()
+            return plan
+    raise KeyError(f"No chunk with id={chunk_id} in plan {plan.get('plan_id')}")
+
+
+def resume_staged_to_pending(plan: Dict[str, Any]) -> Dict[str, Any]:
+    """Reset all 'staged' chunks back to 'pending'.
+
+    Called when the user rejects the staged batch so the plan can be
+    retried or modified without recreating it from scratch.
+    """
+    for c in plan.get("chunks", []):
+        if c["status"] == "staged":
+            c["status"] = "pending"
+            c["output"] = None
+            c["executed_at"] = None
+    return plan
+
+
+def finalize_staged(plan: Dict[str, Any]) -> Dict[str, Any]:
+    """Mark all 'staged' chunks as 'done' after user approval.
+
+    The physical writes are performed by the chatbot worker thread
+    before this is called. This function updates the plan state so the
+    planner can finalize the plan.
+    """
+    for c in plan.get("chunks", []):
+        if c["status"] == "staged":
+            c["status"] = "done"
+            c["executed_at"] = time.time()
+            if not c.get("output"):
+                c["output"] = "Applied (user-approved)"
+    return plan
+
+
 def is_chunk_terminal(status: str) -> bool:
-    """A chunk is terminal if it won't run again: done, failed, or skipped."""
-    return status in ("done", "failed", "skipped")
+    """A chunk is terminal if it won't run again: done, failed, skipped, or staged.
+
+    'staged' is terminal for the executor because the edit is in memory
+    awaiting user approval; the planner decides what to do next.
+    """
+    return status in ("done", "failed", "skipped", "staged")

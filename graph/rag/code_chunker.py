@@ -59,6 +59,11 @@ def chunk_python_file(path: str | Path) -> List[Dict]:
         elif isinstance(node, ast.Assign):
             chunks.append(_node_lines(node, lines, layer="sig", name=_assign_name(node)))
 
+    if not chunks:
+        # Fall back to a lightweight paragraph chunk when AST parsing yielded
+        # no structured nodes (e.g. a file containing only a module docstring).
+        chunks.extend(chunk_text_paragraphs(source, fallback_tag="py_fallback"))
+
     return chunks
 
 

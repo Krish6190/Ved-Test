@@ -93,12 +93,25 @@ def retrieve_context(
             ) or []
         except Exception:
             global_results = []
+    project_results = []
+    if (not thread_results and not global_results) and current_thread_id:
+        try:
+            project_results = rag_db.query_similarity(
+                query_text,
+                k=k,
+                lambda_mult=lambda_mult,
+                scope="project",
+            ) or []
+        except Exception:
+            project_results = []
 
     # Tag with display scope for the prompt formatter.
     for c in thread_results:
         c["scope"] = "thread"
     for c in global_results:
         c["scope"] = "global"
+    for c in project_results:
+        c["scope"] = "project"
 
     if thread_results and global_results:
         thread_contents = {c.get("content") for c in thread_results}
@@ -131,5 +144,10 @@ def retrieve_context(
             return global_results
     if global_results:
         return global_results
+
+    # Project-scope fallback: surface workspace-indexed chunks when both
+    # thread + global miss. Cap at `k` so we don't flood the prompt.
+    if project_results:
+        return project_results[:k]
 
     return []

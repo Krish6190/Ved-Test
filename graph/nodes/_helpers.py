@@ -15,6 +15,8 @@ import re
 from typing import Any, List, Optional, Tuple
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
+from graph.nodes._stream_helpers import _clean_chunk
+
 _NEEDS_TOOL_RE = re.compile(
     r"\b(I can'?t|I cannot|not able to|don'?t have (a )?tool|no tool (found|exists|available))\b",
     re.IGNORECASE,
@@ -164,9 +166,12 @@ def _stream_llm_with_tools(
     for chunk in llm_with_tools.stream(messages_to_stream):
         # Text content - stream to UI token_queue
         if hasattr(chunk, "content") and chunk.content:
-            c = chunk.content if isinstance(chunk.content, str) else str(chunk.content)
-            full_content += c
-            if token_queue:
+            raw = chunk.content if isinstance(chunk.content, str) else str(chunk.content)
+            full_content += raw
+            c = _clean_chunk(raw)
+            if c is None:
+                pass
+            elif token_queue:
                 try:
                     token_queue.put(c)
                 except Exception:

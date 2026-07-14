@@ -1,5 +1,11 @@
+import re
 import tkinter as tk
 from .components import VedComponentLayout
+from graph.nodes._stream_helpers import (
+    _RUNAWAY_NEWLINES_RE,
+    _RUNAWAY_SPACES_RE,
+    _strip_leading_blank_lines,
+)
 
 class VedGuiRenderEngine(VedComponentLayout):
     def __init__(self, root: tk.Tk):
@@ -121,10 +127,33 @@ class VedGuiRenderEngine(VedComponentLayout):
         self.root.after(0, action)
 
     def _append_stream_chunk(self, text: str, color: str = ""):
-        """Appends live AI token streams cleanly pinned onto the left chat margin."""
+        """Appends live AI token streams cleanly pinned onto the left chat margin.
+
+        Normalises the chunk so RUNAWAY whitespace (3+ newlines, 4+ spaces)
+        does not render as a flood of blank lines or accidental indents.
+        Standard "\n" and "\n\n" paragraph breaks are preserved verbatim so
+        the chat panel remains readable. Without this preservation the model
+        streams "\n" as its own chunk between text segments and the entire
+        conversation collapses into one unreadable paragraph.
+        """
+        if not text:
+            return
+        cleaned = text
+        if "\n" in cleaned:
+            cleaned = _RUNAWAY_NEWLINES_RE.sub("\n\n", cleaned)
+        if "    " in cleaned:
+            cleaned = _RUNAWAY_SPACES_RE.sub(" ", cleaned)
+
         def action():
+            try:
+                existing_tail = self.output_text.get("end-2c", "end-1c")
+            except Exception:
+                existing_tail = ""
+            local_cleaned = _strip_leading_blank_lines(cleaned, existing_tail)
+            if not local_cleaned:
+                return
             idx_start = self.output_text.index("end-1c")
-            self.output_text.insert("end", text)
+            self.output_text.insert("end", local_cleaned)
             self.output_text.tag_add("ved_msg", idx_start, "end-1c")
             if not self.user_scrolled_up:
                 self.output_text.see("end")
@@ -160,23 +189,3 @@ class VedGuiRenderEngine(VedComponentLayout):
             target_h = self.default_height
             target_y = self.root.winfo_screenheight() - self.default_height - 49
         self.root.geometry(f"{self.default_width}x{target_h}+{self.root.winfo_x()}+{target_y}")
-
-
-    # def _resize_to_fit_content(self):
-    #     """Dynamically expands the window frame upward to follow your taskbar boundary."""
-    #     self.root.update_idletasks()
-    #     count = self.output_text.count("1.0", "end-1c", "displaylines")
-    #     num_lines = (
-    #         int(count[0]) if isinstance(count, (list, tuple))
-    #         else (int(count) if count is not None
-    #               else int(self.output_text.index("end-1c").split(".")[0]))
-    #     )
-    #     target_h = max(
-    #         self.default_content_h,
-    #         min((num_lines * self.line_height) + 16, self.max_content_h)
-    #     )
-    #     new_h = self.TITLE_BAR_H + target_h + self.INPUT_BAR_H
-    #     self.root.geometry(
-    #         f"{self.default_width}x{new_h}"
-    #         f"+{self.root.winfo_x()}+{self.root.winfo_y() - (new_h - self.root.winfo_height())}"
-    #     )

@@ -4,6 +4,7 @@ import tkinter as tk
 import winsound
 from voice.voice_module import VoiceSystem
 from chatbot import Chatbot
+from graph.tools.staging_registry import STAGING_REGISTRY
 from .gui_rag_worker import VedRagWorker
 from .components import MODE_COLORS
 
@@ -450,8 +451,25 @@ class VedWidget(VedRagWorker):
         self._file_edit_diff_text.insert("1.0", "\n".join(lines))
         self._file_edit_diff_text.config(state="disabled")
 
+    def _get_current_staged_paths(self) -> list:
+        """Return the authoritative set of paths currently staged for approval."""
+        paths = []
+        thread_id = getattr(self.chatbot, "_file_edit_thread_id", None)
+        if thread_id:
+            try:
+                paths = list(STAGING_REGISTRY.get_tasks(thread_id).keys())
+            except Exception:
+                paths = []
+        if not paths:
+            paths = list(self._file_edit_pending_tasks.keys())
+        if not paths and getattr(self, "_file_edit_listbox", None):
+            paths = [self._file_edit_listbox.get(i) for i in range(self._file_edit_listbox.size())]
+        return paths
+ 
     def _submit_file_edit_decision(self, action: str, paths: list | None = None):
-        """Send a file-edit approval decision to the chatbot and close panel if empty."""
+        """Send a file-edit approval decision to the chatbot and keep the review panel open until the backend is notified."""
+        if paths is None and action in ("approve_all", "reject_all"):
+            paths = self._get_current_staged_paths()
         decision = {"action": action, "paths": list(paths) if paths else []}
         try:
             self.chatbot.submit_file_edit_approval(decision)
@@ -460,15 +478,73 @@ class VedWidget(VedRagWorker):
         # The worker will remove approved/rejected entries; refresh on next event.
 
     def _on_file_edit_approve_all(self):
-        self._submit_file_edit_decision("approve_all")
+        # Try to eagerly drain the staging registry for the active session
+        # so the worker doesn't hang waiting for the UI. Do this in a
+        # background thread to avoid blocking the Tk mainloop.
+        decision = {"action": "approve_all", "paths": []}
+        try:
+            thread_id = getattr(self.chatbot, "_file_edit_thread_id", None)
+            if thread_id and STAGING_REGISTRY.has_session(thread_id):
+                def _drain_apply():
+                    try:
+                        STAGING_REGISTRY.apply_decision(
+                            thread_id,
+                            decision,
+                            apply_callback=self.chatbot._apply_file_edit_task,
+                        )
+                    except Exception:
+                        # Fallback to the existing submit path if direct apply fails
+                        try:
+                            self.chatbot.submit_file_edit_approval(decision)
+                        except Exception:
+                            pass
+                    finally:
+                        # Ensure the review panel closes on the main thread.
+                        try:
+                            self.root.after(0, self._force_close_review_panel)
+                        except Exception:
+                            pass
+                threading.Thread(target=_drain_apply, daemon=True).start()
+            else:
+                self._submit_file_edit_decision("approve_all")
+                self._maybe_close_review_panel()
+        except Exception:
+            # Best-effort: fallback to original flow.
+            self._submit_file_edit_decision("approve_all")
+            self._maybe_close_review_panel()
 
     def _on_file_edit_reject_all(self):
-        self._submit_file_edit_decision("reject_all")
+        # Mirror approve_all: ensure the registry is drained and the
+        # review panel is closed even if the worker thread hasn't yet
+        # processed the decision.
+        decision = {"action": "reject_all", "paths": []}
         try:
-            if self._file_edit_review_panel.winfo_exists():
-                self._file_edit_review_panel.withdraw()
+            thread_id = getattr(self.chatbot, "_file_edit_thread_id", None)
+            if thread_id and STAGING_REGISTRY.has_session(thread_id):
+                def _drain_reject():
+                    try:
+                        STAGING_REGISTRY.apply_decision(
+                            thread_id,
+                            decision,
+                            apply_callback=lambda task: "rejected",
+                        )
+                    except Exception:
+                        try:
+                            self.chatbot.submit_file_edit_approval(decision)
+                        except Exception:
+                            pass
+                    finally:
+                        try:
+                            self.root.after(0, self._force_close_review_panel)
+                        except Exception:
+                            pass
+                threading.Thread(target=_drain_reject, daemon=True).start()
+            else:
+                self._submit_file_edit_decision("reject_all")
+                self._maybe_close_review_panel()
         except Exception:
-            pass
+            self._submit_file_edit_decision("reject_all")
+            self._maybe_close_review_panel()
 
     def _on_file_edit_approve_selected(self):
         sel = self._file_edit_listbox.curselection()
@@ -476,6 +552,8 @@ class VedWidget(VedRagWorker):
             return
         paths = [self._file_edit_listbox.get(i) for i in sel]
         self._submit_file_edit_decision("approve", paths)
+        self._remove_listbox_paths(paths)
+        self._maybe_close_review_panel()
 
     def _on_file_edit_reject_selected(self):
         sel = self._file_edit_listbox.curselection()
@@ -483,6 +561,90 @@ class VedWidget(VedRagWorker):
             return
         paths = [self._file_edit_listbox.get(i) for i in sel]
         self._submit_file_edit_decision("reject", paths)
+        self._remove_listbox_paths(paths)
+        self._maybe_close_review_panel()
+
+    def _remove_listbox_paths(self, paths: list):
+        """Delete specific paths from the review listbox.
+
+        Iterates in reverse index order so deleting earlier items does
+        not shift the indices of later items. Any path not currently in
+        the listbox is ignored (idempotent).
+        """
+        if not paths or self._file_edit_listbox is None:
+            return
+        # Build a map of path -> index so we can delete in reverse order.
+        size = self._file_edit_listbox.size()
+        path_to_idx = {}
+        for i in range(size):
+            path_to_idx[self._file_edit_listbox.get(i)] = i
+        indices_to_delete = sorted(
+            (path_to_idx[p] for p in paths if p in path_to_idx),
+            reverse=True,
+        )
+        for idx in indices_to_delete:
+            try:
+                self._file_edit_listbox.delete(idx)
+            except Exception:
+                pass
+        # Also drop the acted-on items from the widget's pending dict so
+        # the UI state stays consistent with the listbox.
+        for p in paths:
+            self._file_edit_pending_tasks.pop(p, None)
+
+    def _maybe_close_review_panel(self):
+        """Close the review panel ONLY when the pending queue is empty.
+
+        Mirrors the worker thread's drain: after apply_decision returns,
+        session.tasks is cleared (or shrunk). The GUI listbox is refreshed
+        by the next file_edit_approval_request payload, but in the
+        per-file flow we have to check the current listbox size here.
+
+        The withdraw() is called via root.after(0, ...) so it runs on the
+        Tk main thread -- the button click handler itself is already on
+        the main thread, but the worker thread may also call into this
+        path via _update_file_edit_review_panel, and that runs on the
+        main thread anyway because it is scheduled through root.after.
+        """
+        panel = getattr(self, "_file_edit_review_panel", None)
+        if panel is None:
+            return
+        try:
+            listbox = getattr(self, "_file_edit_listbox", None)
+            remaining = listbox.size() if listbox is not None else 0
+            if remaining > 0:
+                try:
+                    panel.deiconify()
+                    panel.lift()
+                except Exception:
+                    pass
+                return
+            if panel.winfo_exists():
+                panel.withdraw()
+        except Exception:
+            pass
+
+    def _force_close_review_panel(self):
+        """Forcefully close and destroy the review panel (main-thread only).
+
+        This is used after an approve/reject-all drain to ensure the UI
+        does not remain frozen awaiting worker callbacks.
+        """
+        panel = getattr(self, "_file_edit_review_panel", None)
+        try:
+            if panel is None:
+                return
+            if panel.winfo_exists():
+                try:
+                    panel.withdraw()
+                except Exception:
+                    pass
+                try:
+                    panel.destroy()
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     def _show_file_edit_approval_bar(self, tasks: dict):
         """Show or refresh the cumulative multi-file file-edit review panel.
@@ -691,6 +853,14 @@ class VedWidget(VedRagWorker):
         full_response, printed_newline = "", False
         for event_type, chunk in response_obj:
             if event_type == "token":
+                # Only drop completely empty tokens. Whitespace-only
+                # tokens ("\n", "\n\n", "  ") MUST pass through so the
+                # chat panel renders standard paragraph breaks. Runaway
+                # whitespace (>3 newlines, >4 spaces) is handled by the
+                # producer-side _clean_chunk and the UI renderer's
+                # defence-in-depth check.
+                if not isinstance(chunk, str) or not chunk:
+                    continue
                 full_response += chunk
                 self._append_stream_chunk(chunk)
             elif event_type == "approval_request":
