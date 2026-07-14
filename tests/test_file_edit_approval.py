@@ -590,3 +590,129 @@ def test_submit_file_edit_approval_accepts_bool():
     chatbot.submit_file_edit_approval(False)
     assert chatbot._file_edit_approval_state["value"]["action"] == "reject_all"
     assert chatbot._file_edit_approval_event.is_set()
+
+
+# ---- 12. Chunk 2: post-approval graph-state erasure ----
+# After an approve_all decision, the file-edit approval worker must clear
+# the three graph-state trackers persisted on the Chatbot instance by
+# respond() so the next user turn starts with no in-flight plan/step lock.
+
+
+def _stage_single_approve_all_setup(tmp_path, monkeypatch, thread_id):
+    """Shared setup: bypass safety, register a STAGING_REGISTRY session,
+    stage one edit on a tmp file, and return (chatbot, target).
+
+    The chatbot has _file_edit_* wired up but no plan/step trackers set;
+    each test below sets those explicitly so the assertions are local to
+    each scenario.
+    """
+    _bypass_safety(monkeypatch)
+    from chatbot import Chatbot
+
+    target = tmp_path / "target.py"
+    target.write_text("a\n", encoding="utf-8")
+    event = threading.Event()
+    state = {"value": None}
+    STAGING_REGISTRY.register_session(
+        thread_id, approval_event=event, approval_state=state
+    )
+    STAGING_REGISTRY.stage_edit(
+        thread_id,
+        "edit_file",
+        str(target),
+        {"path": str(target), "old_text": "a", "new_text": "A"},
+        {"old": "a", "new": "A"},
+    )
+
+    chatbot = Chatbot.__new__(Chatbot)
+    chatbot._file_edit_thread_id = thread_id
+    chatbot._file_edit_pending_tasks = {}
+    chatbot._file_edit_pending_lock = threading.Lock()
+    chatbot._file_edit_approval_event = event
+    chatbot._file_edit_approval_state = state
+    chatbot._file_edit_worker_stop = threading.Event()
+    return chatbot, target
+
+
+def _run_chatbot_worker_until_idle(chatbot, decision, settle=0.3):
+    """Start the file-edit approval worker, submit a decision, wait for
+    the worker to process it, then stop the worker. Mirrors the existing
+    staging-registry test pattern in this module.
+    """
+    worker = threading.Thread(
+        target=chatbot._file_edit_approval_worker, daemon=True
+    )
+    worker.start()
+    chatbot.submit_file_edit_approval(decision)
+    time.sleep(settle)
+    chatbot._file_edit_worker_stop.set()
+    worker.join(timeout=1.0)
+
+
+def test_approve_all_clears_active_plan_id(tmp_path, monkeypatch):
+    """approve_all must clear chatbot._active_plan_id to None."""
+    thread_id = "thr_clear_active_plan_id"
+    chatbot, target = _stage_single_approve_all_setup(tmp_path, monkeypatch, thread_id)
+
+    # Pre-condition: a non-None plan id was persisted from the previous
+    # graph stream. The acceptance criterion is that this gets wiped.
+    chatbot._active_plan_id = "deadbeefcafef00d"
+    chatbot._graph_state_current_step = "step_42"
+    chatbot._graph_state_last_step_status = "in_progress"
+
+    _run_chatbot_worker_until_idle(
+        chatbot, {"action": "approve_all", "paths": []}
+    )
+
+    assert chatbot._active_plan_id is None
+
+    STAGING_REGISTRY.unregister_session(thread_id)
+
+
+def test_approve_all_finalizes_plan(tmp_path, monkeypatch):
+    """approve_all must finalize the active plan (status='complete',
+    current_chunk=None)."""
+    thread_id = "thr_finalize_plan"
+    monkeypatch.setattr(plan_store, "PLANS_ROOT", tmp_path)
+
+    # Build a real plan with a staged chunk so finalize_staged actually
+    # has work to do, then mark chunk 1 as staged.
+    plan = plan_store.make_blank_plan("post-approval test", ["edit thing"])
+    plan_store.save_plan(plan)
+    plan = plan_store.load_plan(plan["plan_id"])
+    plan_store.mark_staged(plan, 1)
+    plan_store.save_plan(plan)
+
+    chatbot, target = _stage_single_approve_all_setup(tmp_path, monkeypatch, thread_id)
+    chatbot._active_plan_id = plan["plan_id"]
+
+    _run_chatbot_worker_until_idle(
+        chatbot, {"action": "approve_all", "paths": []}
+    )
+
+    finalized = plan_store.load_plan(plan["plan_id"])
+    assert finalized is not None
+    assert finalized["status"] == "complete"
+    assert finalized["current_chunk"] is None
+
+    STAGING_REGISTRY.unregister_session(thread_id)
+
+
+def test_approve_all_resets_graph_state_trackers(tmp_path, monkeypatch):
+    """approve_all must reset _graph_state_current_step and
+    _graph_state_last_step_status to None."""
+    thread_id = "thr_reset_graph_state_trackers"
+    chatbot, target = _stage_single_approve_all_setup(tmp_path, monkeypatch, thread_id)
+
+    chatbot._active_plan_id = "abc123"
+    chatbot._graph_state_current_step = "executing_chunk_3"
+    chatbot._graph_state_last_step_status = "in_progress"
+
+    _run_chatbot_worker_until_idle(
+        chatbot, {"action": "approve_all", "paths": []}
+    )
+
+    assert chatbot._graph_state_current_step is None
+    assert chatbot._graph_state_last_step_status is None
+
+    STAGING_REGISTRY.unregister_session(thread_id)

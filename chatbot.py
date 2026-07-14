@@ -10,6 +10,7 @@ from graph import build_graph
 from model_adapter import ModelAdapter, parse_modelfile
 from command_processor import ChatbotCommandProcessor
 from graph.tools.staging_registry import STAGING_REGISTRY
+from graph.rag.diff_history import DiffHistoryStore
 import queue
 import threading
 
@@ -168,6 +169,12 @@ class Chatbot(ChatbotCommandProcessor):
         self._llm_cache = {}
         self._threads = {}
         self._active_thread_id = None
+        # Graph-state trackers persisted from the last respond() so the
+        # approval worker can clear them after an approve / approve_all.
+        # Chunk 2 of the structural repair plan wires these up.
+        self._active_plan_id = None
+        self._graph_state_current_step = None
+        self._graph_state_last_step_status = None
         # UI components reference — set by gui.py after the UI is built.
         # Used by command_processor._handle_cd() to push cwd updates to the
         # title-bar chip, and by on_session_start() to push index status.
@@ -181,6 +188,12 @@ class Chatbot(ChatbotCommandProcessor):
         from graph.rag import rag_db
         self._thread_files = ThreadFileStore(rag_db)
         self._global_files = GlobalFileStore(rag_db)
+        # Chunk 4: per-edit diff-delta cache. Lazily created only when a
+        # rag_db is available so tests that use Chatbot.__new__(Chatbot)
+        # (no __init__ run) never touch the embeddings engine.
+        self._diff_history_store = (
+            DiffHistoryStore(rag_db) if rag_db is not None else None
+        )
         if not self._threads:
             self._create_starter_thread()
         self._graph = build_graph(self._get_llm)
@@ -720,6 +733,13 @@ class Chatbot(ChatbotCommandProcessor):
                         yield (event_type, payload)
                 else:
                     yield ("token", item)
+            # Persist trajectory trackers onto the instance so the file-edit
+            # approval worker can clear them after an approve / approve_all.
+            # Chunk 2 of the structural repair plan: capture active_plan_id,
+            # current_step, last_step_status from the streamed state.
+            self._active_plan_id = accumulated_state.get("active_plan_id") or self._active_plan_id
+            self._graph_state_current_step = accumulated_state.get("current_step")
+            self._graph_state_last_step_status = accumulated_state.get("last_step_status")
             if accumulated_state and "messages" in accumulated_state:
                 final_msgs = accumulated_state["messages"]
                 active = self.get_active_thread()
@@ -782,6 +802,11 @@ class Chatbot(ChatbotCommandProcessor):
         # in non-self-healing mode. Mirror the same boundary here so a
         # post-approval apply cannot escape the project tree.
         project_root = str(_Path(__file__).resolve().parent)
+        # Chunk 4: pass the diff-history store so post-approval edits
+        # capture unified diffs in RAG instead of writing .bak files.
+        # getattr fallback keeps Chatbot.__new__(Chatbot)-style tests
+        # (no __init__ invoked) working without the store.
+        diff_store = getattr(self, "_diff_history_store", None)
         try:
             if tool_name == "edit_file":
                 return edit_file_action(
@@ -790,6 +815,7 @@ class Chatbot(ChatbotCommandProcessor):
                     args.get("new_text", ""),
                     allowed_roots=(project_root,),
                     backup_dir=None,
+                    diff_history_store=diff_store,
                 )
             elif tool_name == "overwrite_file":
                 return overwrite_file_action(
@@ -797,6 +823,7 @@ class Chatbot(ChatbotCommandProcessor):
                     args.get("content", ""),
                     allowed_roots=(project_root,),
                     backup_dir=None,
+                    diff_history_store=diff_store,
                 )
             return f"ERROR: unknown file-edit tool '{tool_name}'"
         except Exception as exc:
@@ -843,23 +870,10 @@ class Chatbot(ChatbotCommandProcessor):
             action = (decision or {}).get("action", "reject")
             paths = (decision or {}).get("paths") or []
 
-            # Update the active plan's chunk statuses before/after applying
-            # the decision so the Planner sees the correct state on its
-            # next turn (done on approval, pending on rejection).
-            try:
-                from data import plans as _plan_store
-                plan_id = getattr(self, "_active_plan_id", None)
-                if plan_id:
-                    plan = _plan_store.load_plan(plan_id)
-                    if plan:
-                        if action in ("approve", "approve_all"):
-                            _plan_store.finalize_staged(plan)
-                            _plan_store.finalize(plan, plan.get("summary", ""))
-                        else:
-                            _plan_store.resume_staged_to_pending(plan)
-                        _plan_store.save_plan(plan)
-            except Exception:
-                pass
+            # Capture the active plan id BEFORE apply_decision runs so the
+            # finalize step below still has access to it after the reset
+            # block wipes self._active_plan_id.
+            plan_id = getattr(self, "_active_plan_id", None)
 
             if thread_id and STAGING_REGISTRY.has_session(thread_id):
                 STAGING_REGISTRY.apply_decision(
@@ -892,6 +906,36 @@ class Chatbot(ChatbotCommandProcessor):
                             self._file_edit_pending_tasks.pop(p, None)
                 for task in approved:
                     self._apply_file_edit_task(task)
+
+            # Post-approval graph-state erasure (Chunk 2 of the structural
+            # repair plan). Wipe the three trackers persisted by respond()
+            # so the next user turn starts with no in-flight plan/step
+            # lock. The captured `plan_id` above is still valid because we
+            # are using a local variable, not the just-reset attribute.
+            if action in ("approve", "approve_all"):
+                self._active_plan_id = None
+                self._graph_state_current_step = None
+                self._graph_state_last_step_status = None
+
+            # Update the active plan's chunk statuses after the edits are
+            # applied to disk so the Planner sees the correct state on its
+            # next turn (done on approval, pending on rejection). Uses the
+            # locally-captured plan_id so the reset above does not affect
+            # this step.
+            try:
+                from data import plans as _plan_store
+                if plan_id:
+                    plan = _plan_store.load_plan(plan_id)
+                    if plan:
+                        if action in ("approve", "approve_all"):
+                            _plan_store.finalize_staged(plan)
+                            _plan_store.finalize(plan, plan.get("summary", ""))
+                        else:
+                            _plan_store.resume_staged_to_pending(plan)
+                        _plan_store.save_plan(plan)
+            except Exception:
+                pass
+
             try:
                 state["value"] = None
             except Exception:

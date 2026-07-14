@@ -31,6 +31,7 @@ _DEFAULT_IGNORES = (
     ".pytest_cache/",
     ".mypy_cache/",
     ".ruff_cache/",
+    "*.bak", "*.tmp",   # Chunk 1: ignore backup artifacts in RAG indexing
     "*.pyc", "*.pyo", "*.pyd",
     "*.so", "*.dll", "*.dylib",
     "*.egg-info/",

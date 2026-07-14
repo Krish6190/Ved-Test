@@ -69,7 +69,7 @@ class VedWidget(VedRagWorker):
         self.cmd_popup = None
         self.cmd_listbox = None
         self.input_entry.bind("<KeyRelease>", self._on_input_keyrelease)
-        self._hide_from_screen_capture()
+        # self._hide_from_screen_capture()
         self._update_mode_ui(self.current_mode)
         # Populate the freshly-built tab strip from the active chatbot state.
         self._refresh_thread_tabs()

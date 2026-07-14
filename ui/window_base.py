@@ -48,7 +48,7 @@ MODE_COLORS = {
 }
 
 class VedWindowBase:
-    def __init__(self, root: tk.Tk):
+    def __init__(self, root: tk.Tk): # type: ignore
         self.root = root
         self.root.withdraw()
         self.root.title("Ved")

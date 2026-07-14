@@ -65,7 +65,9 @@ _FILE_EDITING_RULES = (
     "- For new files, use execute_python to write the content (coder mode) or\n"
     "  propose_tool to create a persistent helper that does the write.\n"
     "- edit_file's old_text must match EXACTLY (whitespace and indentation). If\n"
-    "  it doesn't match, read the file again to get the current content."
+    "  it doesn't match, read the file again to get the current content.\n"
+    "- Backup artifacts (*.bak, *.tmp) are ignored by search and RAG and are\n"
+    "  never produced by file edits."
 )
 
 # ---- Dual-role Executor (Typist) prompt template ----

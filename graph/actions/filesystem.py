@@ -20,8 +20,13 @@ Module rules (enforced by the chunk-1 acceptance grep):
 """
 from __future__ import annotations
 import re
-import shutil
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+from graph.tools._common import is_backup_artifact
+
+if TYPE_CHECKING:
+    from graph.rag.diff_history import DiffHistoryStore
 
 _MAX_READ_CHARS = 8000
 
@@ -80,18 +85,6 @@ def _is_under_any(path: Path, allowed_roots: tuple[str, ...]) -> bool:
     return False
 
 
-def _backup_path_for(target: Path, backup_dir: str | None) -> Path:
-    """Where to write the .bak file for `target`.
-
-    If `backup_dir` is provided, write there as `<basename>.bak`. Otherwise
-    fall back to the legacy sibling location (`<file>.bak` next to the
-    original), matching the previous tool-layer behavior.
-    """
-    if backup_dir:
-        return Path(backup_dir) / (target.name + ".bak")
-    return target.with_suffix(target.suffix + ".bak")
-
-
 def _iter_case_insensitive(base: Path, needle: str, skip_dirs: tuple[str, ...]):
     """Yield files under `base` whose name contains `needle` (case-insensitive).
 
@@ -135,6 +128,8 @@ def _search(base: Path, pattern: str, skip_dirs: tuple[str, ...], limit: int) ->
 
     def _add(p: Path) -> None:
         if any(part in set(skip_dirs) for part in p.parts):
+            return
+        if is_backup_artifact(p):
             return
         s = str(p)
         if s in seen:
@@ -232,22 +227,28 @@ def edit_file_action(
     new_text: str,
     *,
     allowed_roots: tuple[str, ...],
-    backup_dir: str | None,
+    backup_dir: str | None = None,
+    diff_history_store: "DiffHistoryStore | None" = None,
 ) -> str:
     """Replace `old_text` with `new_text` inside the file at `path`.
 
-    The first occurrence of `old_text` is replaced. A backup of the
-    pre-edit file is written before any modification (either to
-    `backup_dir/<basename>.bak` if `backup_dir` is provided, or to
-    `<file>.bak` next to the original if `backup_dir` is None).
+    The first occurrence of `old_text` is replaced. Chunk 4 of the
+    structural-repair plan: no physical ``.bak`` file is written.
+    Instead, when ``diff_history_store`` is supplied, the unified diff
+    between the previous and new file contents is handed to the store
+    so it can be embedded under the hidden ``DIFF_HISTORY_SCOPE``.
+    ``backup_dir`` is retained as an accepted keyword for backward
+    compatibility with existing callers but is now ignored.
 
     Args:
         path: Absolute path to the file to edit.
         old_text: Exact substring to find in the existing file.
         new_text: Replacement text.
         allowed_roots: Tuple of permitted root directories.
-        backup_dir: Optional directory for the backup file. None uses the
-                    sibling location (legacy behavior).
+        backup_dir: Legacy argument, ignored. Retained so existing call
+                    sites keep working without modification.
+        diff_history_store: Optional ``DiffHistoryStore`` that captures
+                    the unified diff into the RAG diff-delta cache.
 
     Returns:
         Status string describing the result, or `ERROR: ...` on failure.
@@ -295,22 +296,21 @@ def edit_file_action(
 
     new_contents = current[:idx] + new_text + current[idx + len(old_text):]
 
-    # Backup first; only write if the backup succeeds.
-    backup_target = _backup_path_for(candidate, backup_dir)
-    try:
-        if candidate.exists() and candidate.is_file():
-            current_text = candidate.read_text(encoding="utf-8", errors="replace")
-            if current_text:
-                backup_target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(candidate, backup_target)
-    except Exception as exc:
-        return f"ERROR: Backup failed at {backup_target}: {exc}. Write aborted."
-
     try:
         candidate.parent.mkdir(parents=True, exist_ok=True)
         candidate.write_text(new_contents, encoding="utf-8")
     except Exception as exc:
         return f"ERROR: Failed to write {candidate}: {exc}"
+
+    # Chunk 4: capture the unified diff in RAG instead of writing a .bak.
+    if diff_history_store is not None:
+        try:
+            diff_history_store.add_diff(str(candidate), current, new_contents)
+        except Exception as exc:
+            # Diff capture must never undo a successful write; surface a
+            # warning but keep the OK result so the user still sees the
+            # edit applied.
+            print(f"[edit_file_action] diff capture failed: {exc}")
 
     bytes_written = len(new_contents.encode("utf-8"))
     return f"OK: Edited {candidate} ({bytes_written} bytes written)"
@@ -321,16 +321,24 @@ def overwrite_file_action(
     content: str,
     *,
     allowed_roots: tuple[str, ...],
-    backup_dir: str | None,
+    backup_dir: str | None = None,
+    diff_history_store: "DiffHistoryStore | None" = None,
 ) -> str:
     """Replace the entire contents of `path` with `content`.
+
+    Chunk 4 of the structural-repair plan: no physical ``.bak`` file is
+    written. When ``diff_history_store`` is supplied, the unified diff
+    between the previous and new contents is embedded into RAG under
+    ``DIFF_HISTORY_SCOPE``. ``backup_dir`` is retained for backward
+    compatibility but is now ignored.
 
     Args:
         path: Absolute path to the file to overwrite.
         content: The new file contents.
         allowed_roots: Tuple of permitted root directories.
-        backup_dir: Optional directory for the backup file. None uses the
-                    sibling location (legacy behavior).
+        backup_dir: Legacy argument, ignored.
+        diff_history_store: Optional ``DiffHistoryStore`` that captures
+                    the unified diff into the RAG diff-delta cache.
 
     Returns:
         Status string describing the result, or `ERROR: ...` on failure.
@@ -348,21 +356,27 @@ def overwrite_file_action(
     if not _is_under_any(candidate, allowed_roots):
         return f"ERROR: Refused to overwrite '{path}' - outside allowed roots."
 
-    backup_target = _backup_path_for(candidate, backup_dir)
-    try:
-        if candidate.exists() and candidate.is_file():
-            current_text = candidate.read_text(encoding="utf-8", errors="replace")
-            if current_text:
-                backup_target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(candidate, backup_target)
-    except Exception as exc:
-        return f"ERROR: Backup failed at {backup_target}: {exc}. Write aborted."
+    # Chunk 4: read existing contents (if any) so we can capture a diff
+    # AFTER the write. We do NOT copy the file anywhere -- the diff
+    # history store is the single source of recovery.
+    previous_contents = ""
+    if candidate.exists() and candidate.is_file():
+        try:
+            previous_contents = candidate.read_text(encoding="utf-8", errors="replace")
+        except Exception as exc:
+            return f"ERROR: Failed to read existing file {candidate}: {exc}"
 
     try:
         candidate.parent.mkdir(parents=True, exist_ok=True)
         candidate.write_text(content, encoding="utf-8")
     except Exception as exc:
         return f"ERROR: Failed to write {candidate}: {exc}"
+
+    if diff_history_store is not None:
+        try:
+            diff_history_store.add_diff(str(candidate), previous_contents, content)
+        except Exception as exc:
+            print(f"[overwrite_file_action] diff capture failed: {exc}")
 
     bytes_written = len(content.encode("utf-8"))
     return f"OK: Overwrote {candidate} ({bytes_written} bytes written)"

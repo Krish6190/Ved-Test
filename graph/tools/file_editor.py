@@ -108,6 +108,8 @@ def edit_file(
     Shows a tkinter approval popup before writing. The first occurrence of
     `old_text` is replaced. Both `path` and `old_text` are optional - if
     omitted, the tool infers the file from the last user message.
+    Backup artifacts (*.bak, *.tmp) are ignored by search and RAG and are
+    never produced by file edits.
 
     Args:
         path: Absolute path, or path relative to project root (self-healing)
@@ -180,6 +182,8 @@ def overwrite_file(
 
     Shows a tkinter approval popup before writing. `path` is optional and
     is inferred from the last user message when omitted.
+    Backup artifacts (*.bak, *.tmp) are ignored by search and RAG and are
+    never produced by file edits.
 
     Args:
         path: Absolute path, or path relative to project root (self-healing)

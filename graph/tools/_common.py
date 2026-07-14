@@ -19,6 +19,25 @@ from langchain_core.messages import HumanMessage
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 MAX_RESULTS = 100
+
+# Backup/tmp extensions that must NEVER appear in search, glob, or RAG
+# results. Chunk 1 of the structural-repair plan: backup artifacts
+# (`*.bak`, `*.tmp`) are filtered at every boundary so the agent cannot
+# read, edit, or re-index stale backup copies.
+ALWAYS_SKIP_SUFFIXES = {".bak", ".tmp"}
+
+
+def is_backup_artifact(path: Path) -> bool:
+    """True if the file name ends with a backup/tmp extension.
+
+    Matching is case-insensitive on the suffix (`.BAK` == `.bak`) so we
+    catch editor-generated uppercase variants as well. Returns False for
+    paths that are not file-like or have no extension at all.
+    """
+    try:
+        return path.suffix.lower() in ALWAYS_SKIP_SUFFIXES
+    except Exception:
+        return False
 ALWAYS_SKIP_DIRS = {
     # Python / venv
     ".venv", "venv", "__pycache__",
@@ -179,7 +198,11 @@ def find_file(base: Path, pattern: str) -> Path | None:
     match, or None if nothing is found.
     """
     def _clean(p: Path) -> bool:
-        return not any(part in ALWAYS_SKIP_DIRS for part in p.parts)
+        if any(part in ALWAYS_SKIP_DIRS for part in p.parts):
+            return False
+        if is_backup_artifact(p):
+            return False
+        return True
 
     # Strategy 1: exact glob
     try:
@@ -219,6 +242,8 @@ def find_files(base: Path, pattern: str, limit: int = MAX_RESULTS) -> list[str]:
 
     def _add(p: Path) -> None:
         if any(part in ALWAYS_SKIP_DIRS for part in p.parts):
+            return
+        if is_backup_artifact(p):
             return
         s = str(p)
         if s in seen:

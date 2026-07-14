@@ -322,6 +322,53 @@ class TestSearchFiles:
 
 
 # ---------------------------------------------------------------------------
+# find_file helper -- Chunk 1 acceptance criteria
+# ---------------------------------------------------------------------------
+
+
+def test_find_file_skips_bak_and_tmp(tmp_path: Path):
+    """Chunk 1 AC #1: ``find_file`` must never resolve a ``.bak`` or ``.tmp``
+    file even when one exists and the pattern matches.
+
+    Covers all three match strategies:
+      - Strategy 1 (exact glob ``*.bak``)
+      - Strategy 2 (case-insensitive name substring, e.g. searching ``.bak``)
+      - Strategy 3 (full-path substring, e.g. searching ``notes``)
+    """
+    from graph.tools._common import find_file, is_backup_artifact, ALWAYS_SKIP_SUFFIXES
+
+    # Sanity: the constants the spec requires.
+    assert ".bak" in ALWAYS_SKIP_SUFFIXES
+    assert ".tmp" in ALWAYS_SKIP_SUFFIXES
+    assert is_backup_artifact(Path("foo.bak")) is True
+    assert is_backup_artifact(Path("FOO.BAK")) is True  # case-insensitive
+    assert is_backup_artifact(Path("foo.tmp")) is True
+    assert is_backup_artifact(Path("foo.py")) is False
+
+    # Lay out: one real file + backup + tmp.
+    (tmp_path / "real.py").write_text("r", encoding="utf-8")
+    (tmp_path / "notes.bak").write_text("old", encoding="utf-8")
+    (tmp_path / "scratch.tmp").write_text("tmp", encoding="utf-8")
+
+    # Strategy 1: exact glob for the backup extension -> None.
+    assert find_file(tmp_path, "*.bak") is None
+    assert find_file(tmp_path, "*.tmp") is None
+
+    # Strategy 2: substring search for the backup extension -> None.
+    assert find_file(tmp_path, ".bak") is None
+    assert find_file(tmp_path, ".tmp") is None
+
+    # Strategy 3: substring search by basename -- should NOT pick the .bak.
+    found = find_file(tmp_path, "notes")
+    assert found is None, (
+        f"substring search must not resolve a .bak file; got {found!r}"
+    )
+
+    # Sanity: the real file is still findable.
+    assert find_file(tmp_path, "real.py") == tmp_path / "real.py"
+
+
+# ---------------------------------------------------------------------------
 # execute_python
 # ---------------------------------------------------------------------------
 
@@ -391,3 +438,22 @@ class TestExecutePython:
                 })
         assert "ERROR" in result
         assert "timeout" in result.lower()
+
+
+# ---------------------------------------------------------------------------
+# Chunk 5: System-rule note about backup artifacts
+# ---------------------------------------------------------------------------
+
+
+def test_file_editing_rules_mention_backup_artifacts():
+    """Chunk 5 AC #5: the executor's _FILE_EDITING_RULES string must reference
+    ``.bak`` (or ``*.bak``) so the LLM sees the system-level rule about
+    backup artifacts being ignored and never produced."""
+    from graph.nodes.executor import _FILE_EDITING_RULES
+
+    assert isinstance(_FILE_EDITING_RULES, str)
+    lowered = _FILE_EDITING_RULES.lower()
+    assert "*.bak" in lowered or ".bak" in lowered, (
+        "_FILE_EDITING_RULES must mention backup artifacts (*.bak); "
+        f"got: {_FILE_EDITING_RULES!r}"
+    )
