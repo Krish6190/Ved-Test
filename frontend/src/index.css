@@ -1,0 +1,68 @@
+:root {
+  /* Core Panels & Layouts */
+  --bg-main: #000000;
+  --bg-surface: #0B0909;
+  --bg-panel: #233D4D;
+  --border-subtle: #17433F;
+
+  /* Typography */
+  --text-primary: #EAECF0;
+  --text-terminal: #EFEABB;
+  --text-muted: #558467;
+
+  /* Feature & Mode Accent Mapping */
+  --color-coder: #558467;
+  --color-turbo: #FE7F2D;
+  --color-standard: #1B4EF5;
+  --color-hibernate: #4B1426;
+
+  /* Typography Fallbacks */
+  --sans: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --mono: ui-monospace, SFMono-Regular, Consolas, 'Courier New', monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  background-color: var(--bg-main);
+  color: var(--text-primary);
+  font-family: var(--sans);
+  font-size: 14px;
+  line-height: 1.5;
+  overflow: hidden; /* Stops browser-style scrolling on the main desktop window */
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Forces the React root container to expand over the entire desktop window frame */
+#root {
+  width: 100vw;
+  height: 100vh;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Custom Scrollbar Theme for the chat feed viewport and sidebar logs */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--bg-main);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border-subtle);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-muted);
+}

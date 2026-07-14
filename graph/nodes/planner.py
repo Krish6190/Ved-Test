@@ -121,154 +121,47 @@ def parse_planner_output(text: str) -> Tuple[str, Any]:
 
 # ---- System prompt ----
 
-_PLANNER_SYSTEM = SystemMessage(content=(
-    "You are the PLANNER role in a planner-executor pipeline.\n"
+_PLANNER_SYSTEM_BASE = (
+    "You are the PLANNER in a planner-executor pipeline.\n"
     "\n"
-    "TOOLS AVAILABLE: you have ONE tool: `retrieve_rag(query, scope, k)`. "
-    "It pulls relevant content from the thread's RAG store (past AI "
-    "responses that got compressed, uploaded files, etc.). Use it when "
-    "you need to look up what was discussed or decided in earlier turns. "
-    "You do NOT have read_file, edit_file, execute_python, or any other "
-    "destructive tools — those are the executor's job.\n"
+    "TOOL: retrieve_rag(query, scope, k) — pulls relevant text from the thread/project RAG store. "
+    "Use it for past-chat recall, codebase exploration, or when the user points at a directory. "
+    "You do NOT have file-editing or execution tools; those belong to the executor.\n"
     "\n"
-    "OUTPUT FORMAT — output exactly ONE of these markers per turn:\n"
+    "OUTPUT EXACTLY ONE marker per turn:\n"
+    "  CREATE_PLAN: [\"<chunk 1>\", ...] — first turn, 1-5 self-contained chunks\n"
+    "  DIRECT_ANSWER: <text> — simple non-tool replies only\n"
+    "  EXECUTE_NEXT — continue an in-progress plan\n"
+    "  FINAL_SUMMARY: <text> — all chunks complete\n"
+    "  ADD_CHUNK_AFTER <id>: INSTRUCTION: <text> — insert a fix-up step\n"
+    "  REPLACE_CHUNK <id>: INSTRUCTION: <text> — rewrite and retry a failed chunk\n"
+    "  REMOVE_CHUNK <id> — drop an irrelevant chunk\n"
+    "  SKIP_CHUNK <id> REASON: <text> — benign failure, move on\n"
     "\n"
-    "  CREATE_PLAN: [\"<chunk 1>\", \"<chunk 2>\", ...]\n"
-    "    Use on the FIRST turn when the task needs multiple tool-using "
-    "steps. Each chunk should be SELF-CONTAINED: include the action, the "
-    "file/data to act on, and any context from prior chunks the executor "
-    "needs. List 1-5 chunks.\n"
+    "Rules:\n"
+    "  - Default to CREATE_PLAN for any tool/file/code/search request. DIRECT_ANSWER only for chitchat or facts.\n"
+    "  - Each chunk instruction must be self-contained (action, target, context); the executor sees no history.\n"
+    "  - Failure triage: REPLACE_CHUNK (executor mistake), SKIP_CHUNK (benign/broken tool), or STOP with FINAL_SUMMARY.\n"
+    "  - retrieve_rag scopes: scope=thread for past chat; paths=['dir/'] for a folder; no filter for generic search. Empty = use search_files.\n"
+    "  - Never call web_search for files in this project; it is not in your tool registry.\n"
+)
+
+_PLANNER_RECOMMEND_CODER_BLOCK = (
     "\n"
-    "  RECOMMEND_CODER_MODE REASON: <why coder mode is needed>\n"
-    "    Use ONLY when the current mode is standard/turbo and the user "
-    "asks to WRITE, EDIT, DELETE, or otherwise modify files or run code. "
-    "Do NOT emit DIRECT_ANSWER with editing instructions — tell the user "
-    "to switch to coder mode instead.\n"
-    "\n"
-    "  DIRECT_ANSWER: <your answer>\n"
-    "    Use when the task is SIMPLE and does not need any tools: factual "
-    "questions, chitchat, explanations, opinions. Do NOT use for editing, "
-    "writing, or running code.\n"
-    "\n"
-    "  EXECUTE_NEXT\n"
-    "    Use on subsequent turns when the plan is in progress and the "
-    "executor just finished chunk N.\n"
-    "\n"
-    "  FINAL_SUMMARY: <one paragraph wrap-up>\n"
-    "    Use when all chunks are complete.\n"
-    "\n"
-    "  ADD_CHUNK_AFTER <id>:\n"
-    "    INSTRUCTION: <new chunk text>\n"
-    "    Insert a new pending chunk right after chunk <id>. Use when the\n"
-    "    executor failed and you want to insert a fix-up step BEFORE\n"
-    "    retrying (e.g., 'first locate the file, then edit').\n"
-    "\n"
-    "  REPLACE_CHUNK <id>:\n"
-    "    INSTRUCTION: <new instruction>\n"
-    "    Overwrite an existing chunk's instruction. Resets it to pending.\n"
-    "    Use when a chunk needs a different approach (e.g., wrong file path).\n"
-    "\n"
-    "  REMOVE_CHUNK <id>\n"
-    "    Drop a chunk from the plan. Use when a chunk is no longer\n"
-    "    relevant (e.g., task was already done by an earlier chunk).\n"
-    "\n"
-    "  SKIP_CHUNK <id> REASON: <text>\n"
-    "    Mark a chunk as skipped (terminal). Use when the failure is not\n"
-    "    critical — executor used the tool wrong, or the tool itself\n"
-    "    is broken in a way downstream chunks don't depend on. The\n"
-    "    executor moves on to the next pending chunk.\n"
-    "\n"
-    "FAILURE TRIAGE (important):\n"
-    "  When a chunk fails, decide between:\n"
-    "  - REPLACE_CHUNK: the executor made a mistake (wrong path, wrong args).\n"
-    "    Rewrite the instruction to be clearer and retry.\n"
-    "  - SKIP_CHUNK: the tool itself is broken / the failure is benign\n"
-    "    AND downstream chunks don't need this chunk's output.\n"
-    "  - SKIP_CHUNK + emit FINAL_SUMMARY next: the tool is broken AND the\n"
-    "    failure blocks downstream chunks. Stop here with an honest error.\n"
-    "  - ADD_CHUNK_AFTER: insert a prerequisite step first (e.g., 'first\n"
-    "    locate the file'). Use sparingly — SKIP/REPLACE usually cover it.\n"
-    "\n"
-    "CHUNK INSTRUCTION QUALITY (important):\n"
-    "  - Each chunk is executed IN ISOLATION by the executor. The executor "
-    "    does NOT see the conversation history. So every chunk instruction "
-    "    must be self-contained: state the action, the target, and any "
-    "    relevant context the executor can't infer.\n"
-    "  - BAD: 'Refactor that function.'\n"
-    "  - GOOD: 'Open foo.py and refactor the `login(user, password)` "
-    "    function on line 42 to use `auth_lib.login()` instead. The "
-    "    function should return a Token object, not a dict.'\n"
-    "\n"
-    "GUIDELINES:\n"
-       "  - DEFAULT to CREATE_PLAN when the task involves tools, files, code,\n"
-       "search, or any concrete action. Most real tasks fall here.\n"
-       "  - Use DIRECT_ANSWER ONLY for clearly non-tool queries: chitchat,\n"
-       "greetings, factual lookups, opinions, explanations of general\n"
-       "knowledge. If the user is asking 'how' or 'why' about a concept,\n"
-       "that's DIRECT_ANSWER. If they're asking 'do X to Y', that's a plan.\n"
-       "  - When in doubt, prefer CREATE_PLAN over DIRECT_ANSWER. The plan\n"
-       "can be one chunk if it's truly simple; DIRECT_ANSWER skips the\n"
-       "executor entirely so the user gets no tool support at all.\n"
-       "  - EXECUTOR TOOLS (what the executor can actually do for you):\n"
-       "      Path A (standard/turbo) executor: read_file, search_files,\n"
-       "        retrieve_rag, open_app. READ-ONLY.\n"
-       "      Coder executor (full set): read_file, edit_file, overwrite_file,\n"
-       "        search_files, execute_python, propose_tool, retrieve_rag, open_app.\n"
-       "      When you CREATE_PLAN, write chunk instructions assuming the\n"
-       "      executor's tools above are available. The executor picks the\n"
-       "      right set automatically based on the active mode.\n"
-       "  - DECISION TREE — classify the request BEFORE calling retrieve_rag:\n"
-       "      User mentions a SPECIFIC file ('read foo.py', 'edit bar.py'):\n"
-       "        straight to read_file/edit_file chunk. No retrieve_rag needed.\n"
-       "      User mentions a SPECIFIC directory ('check voice/', 'look in\n"
-       "        api/'): retrieve_rag(query, paths=['voice/']) chunk first.\n"
-       "        If hits, optionally follow with read_file on the strongest hit.\n"
-       "      User asks about the project GENERICALLY ('check the project',\n"
-       "        'review the code', 'what does this codebase do'):\n"
-       "        retrieve_rag(query) with no paths filter — pulls across the\n"
-       "        whole indexed codebase. Use hits to decide which file(s) to\n"
-       "        read_file next.\n"
-       "      Past-chat references ('as we discussed', 'the answer from\n"
-       "        earlier'): retrieve_rag(query, scope=thread) — same as before.\n"
-       "  - RETRIEVE_RAG — TWO USES (previously these were split; now unified):\n"
-       "      PAST CHAT ('what did you tell me about X', 'recall the auth\n"
-       "        discussion from earlier'): retrieve_rag(query). Returns\n"
-       "        compressed AI responses + uploaded files for the active thread.\n"
-       "      ON-DISK CODE ('find the voice tuner', 'where is auth handled',\n"
-       "        'which file uses OpenAI', 'what's in the planner'):\n"
-       "        retrieve_rag(query, paths=['voice/']) — searches the project\n"
-       "        indexer scope for chunks of source code in the relevant folder.\n"
-       "        Use this BEFORE read_file when you're exploring a codebase you\n"
-       "        haven't been pointed at a specific file in. Empty result =\n"
-       "        'not in scope' -> fall back to search_files.\n"
-       "      COMBINED: a request like 'find the auth code we discussed last\n"
-       "        week' -> first retrieve_rag(query='auth', scope=thread) for past\n"
-       "        chat; if that surfaces a filename, then retrieve_rag(query='auth',\n"
-       "        paths=['src/']) for the code; then read_file on the hit.\n"
-       "  - LOCAL FILE OR COMPONENT QUERIES — STRICT RULE (important):\n"
-       "      NEVER call web_search for files in this project. web_search is for\n"
-       "      external/upstream info the user explicitly asks about (e.g. 'latest\n"
-       "      Python docs', 'OpenRouter pricing'). For local files use search_files\n"
-       "      (filesystem glob) or retrieve_rag (RAG store). If you're not sure\n"
-       "      whether something is local, assume local and use search_files first.\n"
-       "      web_search is NOT in your tool registry — if you think you need it,\n"
-       "      tell the user you can't access the web rather than fabricating a\n"
-       "      web_search tool call.\n"
-       "\n"
-       "  - SELECTIVE INDEXING — decide whether to scope the RAG query:\n"
-       "      GENERIC ('check what's wrong', 'fix this', 'review the code',\n"
-       "        'what changed', 'look at everything'): no path filter. Call\n"
-       "        retrieve_rag(query) — returns matches across the whole project.\n"
-       "      SPECIFIC ('fix voice in voice folder', 'look at src/main.py',\n"
-       "        'what's in the api/ directory', 'check the tests'): scope the\n"
-       "        query to that path. Either:\n"
-       "        a) retrieve_rag(query, paths=['voice/']) — fast, narrow result\n"
-       "        b) Add a search_files chunk first, then read_file on matches.\n"
-       "      If unsure, start generic. You can re-query with paths if the\n"
-       "      generic result is too noisy or off-target.\n"
-       "      The project indexer has already chunked everything in cwd. The\n"
-       "      paths filter is a query-time concern — you don't need to re-index.\n"
-))
+    "RECOMMEND_CODER_MODE REASON: <why>\n"
+    "  Use ONLY in standard/turbo mode when the user asks to write, edit, delete, or run code. "
+    "Do NOT emit DIRECT_ANSWER for editing tasks; use RECOMMEND_CODER_MODE instead. "
+    "Tell the user to switch to coder mode.\n"
+)
+
+_PLANNER_SYSTEM = SystemMessage(content=_PLANNER_SYSTEM_BASE + _PLANNER_RECOMMEND_CODER_BLOCK)
+
+
+def _build_planner_system_prompt(mode: str) -> str:
+    """Return the planner system prompt, omitting the coder recommendation in coder mode."""
+    if mode == "coder":
+        return _PLANNER_SYSTEM_BASE
+    return _PLANNER_SYSTEM_BASE + _PLANNER_RECOMMEND_CODER_BLOCK
 
 
 # ---- Model-aware message cap ----
@@ -309,7 +202,7 @@ def _build_planner_prompt(state: VedState, plan: Optional[Dict[str, Any]], confi
     user_msgs = [m for m in state.messages if isinstance(m, HumanMessage)]
     last_user = user_msgs[-1].content if user_msgs else ""
 
-    msgs = [_PLANNER_SYSTEM, _FRESH_QUESTION_HINT]
+    msgs = [SystemMessage(content=_build_planner_system_prompt(state.mode)), _FRESH_QUESTION_HINT]
     # RAG auto-injection: same as chat_node does. Without this, a user
     # who uploads a file via /files/thread and then asks about it gets
     # a DIRECT_ANSWER with no awareness of the uploaded content. With
@@ -538,29 +431,19 @@ def _stream_with_tool_loop(llm, msgs, config, token_queue, max_rounds=_MAX_PLANN
             return ai_msg, tool_messages, last_rag_results
 
         if round_idx >= max_rounds:
-            # Hit tool-call budget. Return whatever the LLM said plus
-            # any tool messages accumulated so far.
             return ai_msg, tool_messages, last_rag_results
-
-        # Execute each tool call, collect results, and re-invoke.
-        # call_cache memoizes retrieve_rag results within this planner turn.
         for tc in tool_calls_list:
             result_content = _execute_planner_tool_call(tc, config, call_cache)
             tool_messages.append(ToolMessage(
                 content=result_content,
                 tool_call_id=tc["id"],
             ))
-            # Capture retrieve_rag results so the planner node can attach
-            # them to each chunk as `context_blocks` (surfaced by the
-            # executor as background context). Skip ERROR results so a
-            # broken RAG call doesn't poison the prompt with error text.
             if tc.get("name") == "retrieve_rag" and not result_content.startswith("ERROR"):
                 last_rag_results.append(result_content)
         # Loop again with the tool messages appended.
         msgs = list(msgs) + [ai_msg] + tool_messages
 
     return ai_msg, tool_messages, last_rag_results  # unreachable but satisfies the type checker
-
 
 # ---- Human-in-the-loop: plan approval gate ----
 
@@ -620,6 +503,29 @@ def planner_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
                         plan = candidate
                         plan_id = pid
                         break
+    if getattr(state, "summary_emitted", False):
+        return {
+            "messages": [],
+            "route_intent": "A",
+            "mode": state.mode,
+            "active_plan_id": None,
+            "current_chunk_id": None,
+            "current_step": None,
+            "last_step_status": "",
+        }
+    current_step = getattr(state, "current_step", None)
+    last_step_status = getattr(state, "last_step_status", "")
+    if current_step is not None and last_step_status == "dispatched":
+        return {
+            "messages": [],
+            "route_intent": "P",
+            "mode": state.mode,
+            "active_plan_id": getattr(state, "active_plan_id", None),
+            "current_chunk_id": getattr(state, "current_chunk_id", None),
+            "current_step": current_step,
+            "last_step_status": last_step_status,
+        }
+
     if plan is not None:
         for c in plan.get("chunks", []):
             if c.get("retry_count", 0) >= 4:
@@ -681,7 +587,7 @@ def planner_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
             }
             return updates
         thinker_msgs = [
-            _PLANNER_SYSTEM,
+            SystemMessage(content=_build_planner_system_prompt(state.mode)),
             _build_thinker_prompt(code_snippet),
         ]
         full_content = _stream_text(llm, thinker_msgs, token_queue)
@@ -798,6 +704,8 @@ def planner_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
         plan_store.save_plan(new_plan)
         updates["active_plan_id"] = new_plan["plan_id"]
         updates["current_chunk_id"] = first["id"]
+        updates["current_step"] = first["id"]
+        updates["last_step_status"] = "dispatched"
         updates["route_intent"] = "P"
     elif kind == "execute_next":
         if plan is None:
@@ -810,12 +718,11 @@ def planner_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
             updates["route_intent"] = "P_FINALIZE"
             plan_store.save_plan(plan)
         else:
-            # Preserve the current plan state when a previous chunk is
-            # already staged in memory; move straight to the next pending
-            # chunk so the executor doesn't loop back to the start.
             plan_store.mark_executing(plan, nxt["id"])
             plan_store.save_plan(plan)
             updates["current_chunk_id"] = nxt["id"]
+            updates["current_step"] = nxt["id"]
+            updates["last_step_status"] = "dispatched"
             updates["route_intent"] = "P"
 
     elif kind == "add_chunk_after":
@@ -827,6 +734,8 @@ def planner_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
             new_chunk = plan_store.add_chunk_after(plan, anchor_id, instruction)
             plan_store.save_plan(plan)
             updates["current_chunk_id"] = new_chunk["id"]
+            updates["current_step"] = new_chunk["id"]
+            updates["last_step_status"] = "dispatched"
             updates["route_intent"] = "P"  # executor will pick up the new chunk
             if token_queue:
                 try:
@@ -850,6 +759,8 @@ def planner_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
             replaced = plan_store.replace_chunk(plan, chunk_id, instruction)
             plan_store.save_plan(plan)
             updates["current_chunk_id"] = replaced["id"]
+            updates["current_step"] = replaced["id"]
+            updates["last_step_status"] = "dispatched"
             updates["route_intent"] = "P"
             if token_queue:
                 try:
@@ -886,6 +797,8 @@ def planner_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
                 plan_store.mark_executing(plan, nxt["id"])
                 plan_store.save_plan(plan)
                 updates["current_chunk_id"] = nxt["id"]
+                updates["current_step"] = nxt["id"]
+                updates["last_step_status"] = "dispatched"
                 updates["route_intent"] = "P"
         except KeyError:
             updates["route_intent"] = "P"
@@ -914,6 +827,8 @@ def planner_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
                 plan_store.mark_executing(plan, nxt["id"])
                 plan_store.save_plan(plan)
                 updates["current_chunk_id"] = nxt["id"]
+                updates["current_step"] = nxt["id"]
+                updates["last_step_status"] = "dispatched"
                 updates["route_intent"] = "P"
         except KeyError:
             updates["route_intent"] = "P"
@@ -925,8 +840,11 @@ def planner_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
         # Store the user-facing final answer.
         updates["messages"] = [AIMessage(content=payload)]
         updates["final_summary"] = payload
+        updates["summary_emitted"] = True
         updates["active_plan_id"] = None
         updates["current_chunk_id"] = None
+        updates["current_step"] = None
+        updates["last_step_status"] = ""
         updates["route_intent"] = "A"
 
     elif kind == "recommend_coder":
@@ -938,15 +856,24 @@ def planner_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
             f"Reason: {reason}"
         ))]
         updates["active_plan_id"] = None
+        updates["current_chunk_id"] = None
+        updates["current_step"] = None
+        updates["last_step_status"] = ""
 
     elif kind == "direct_answer":
         updates["route_intent"] = "A"
         updates["messages"] = [AIMessage(content=payload)]
         updates["active_plan_id"] = None
+        updates["current_chunk_id"] = None
+        updates["current_step"] = None
+        updates["last_step_status"] = ""
 
     else:  # fallback
         updates["route_intent"] = "A"
         updates["messages"] = [AIMessage(content=full_content or payload or "")]
         updates["active_plan_id"] = None
+        updates["current_chunk_id"] = None
+        updates["current_step"] = None
+        updates["last_step_status"] = ""
 
     return updates

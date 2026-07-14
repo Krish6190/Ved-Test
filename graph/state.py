@@ -44,7 +44,10 @@ class VedState(BaseModel):
     needs_planning: bool = Field(default=False)
     active_plan_id: Optional[str] = Field(default=None)
     current_chunk_id: Optional[int] = Field(default=None)
+    current_step: Optional[int] = Field(default=None)
+    last_step_status: Literal["", "dispatched", "done", "failed", "staged_in_memory"] = Field(default="")
     final_summary: Optional[str] = Field(default=None)
+    summary_emitted: bool = Field(default=False)
     active_thread_id: str = Field(default="")
     dual_role_phase: Literal["", "analyze", "execute", "stage"] = Field(default="")
     fix_instruction: str = Field(default="")  # PLANNER_OUTPUT

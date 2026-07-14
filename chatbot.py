@@ -21,9 +21,8 @@ THREAD_MESSAGE_CAP = 40  # 1 system prompt + up to 39 other messages; matches gr
 # rather than fabricate. Once a web-search tool is added in a future pass, this
 # instruction can be softened to "use web search instead of fabricating".
 HALLUCINATION_GUARD = (
-    "\n\nIMPORTANT: If you cannot answer from your training data or any "
-    "provided context, respond with 'I don't know' rather than fabricating "
-    "information."
+    "\n\nIf you lack the answer from training data or provided context, "
+    "respond 'I don't know' — do not fabricate."
 )
 
 def _trim_thread_messages(messages: list) -> list:
@@ -351,6 +350,54 @@ class Chatbot(ChatbotCommandProcessor):
             except Exception: pass
         return ModelAdapter(model_name=model_name, device=device, params=params, system_prompt=info.get("system", ""))
 
+    def _is_recommendation_payload(self, text: str) -> bool:
+        if not text:
+            return False
+        lower = text.lower()
+        return (
+            "recommend_coder_mode" in lower
+            or "recommend coder" in lower
+            or "switch to coder mode" in lower
+            or "switch to coder" in lower
+        )
+ 
+    def _sanitize_system_prompt(self, prompt: str, mode: str) -> str:
+        if mode != "coder":
+            return prompt
+        return "\n".join(
+            line for line in prompt.splitlines()
+            if not self._is_recommendation_payload(line)
+        ).strip()
+ 
+    def _compact_system_prompt(self, prompt: str) -> str:
+        lines = [line.strip() for line in prompt.splitlines()]
+        compacted = []
+        seen = set()
+        for line in lines:
+            if not line:
+                if compacted and compacted[-1] == "":
+                    continue
+                compacted.append("")
+                continue
+            if line in seen:
+                continue
+            seen.add(line)
+            compacted.append(line)
+        return "\n".join(compacted).strip()
+ 
+    def _optimize_system_prompt(self, prompt: str, mode: str) -> str:
+        prompt = self._sanitize_system_prompt(prompt, mode)
+        prompt = self._compact_system_prompt(prompt)
+        return prompt
+ 
+    def _clear_legacy_recommendation_system_messages(self) -> None:
+        for thread in self._threads.values():
+            filtered = [
+                msg for msg in thread.get("messages", [])
+                if not (isinstance(msg, SystemMessage) and self._is_recommendation_payload(msg.content))
+            ]
+            thread["messages"] = filtered
+
     def _get_llm(self):
         if self.mode == "hibernate": return None
         if self.mode in self._llm_cache: return self._llm_cache[self.mode]
@@ -443,6 +490,8 @@ class Chatbot(ChatbotCommandProcessor):
         old_mode = self.mode
         self.mode = mode
         self._hibernating = (mode == "hibernate")
+        if mode == "coder":
+            self._clear_legacy_recommendation_system_messages()
         self._llm_cache.clear()
         base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 
@@ -598,6 +647,11 @@ class Chatbot(ChatbotCommandProcessor):
                 "content_score": 0,
                 "loop_count": 0,
                 "active_thread_id": thread_id,
+                # Transition-lock seeds — these reset the planner/executor
+                # handshake to a clean baseline so each respond() call
+                # starts with no in-flight chunk dispatch.
+                "current_step": None,
+                "last_step_status": "",
             }
             token_queue = queue.Queue()
             self._human_approval_event = threading.Event()
@@ -617,7 +671,8 @@ class Chatbot(ChatbotCommandProcessor):
                 approval_event=self._file_edit_approval_event,
                 approval_state=self._file_edit_approval_state,
             )
-            config = {"configurable": {"system_prompt": adapter.system_prompt + HALLUCINATION_GUARD, "token_queue": token_queue, "approval_event": self._human_approval_event, "approval_state": self._human_approval_state, "plan_approval_event": self._plan_approval_event, "plan_approval_state": self._plan_approval_state, "tool_creation_event": self._tool_creation_event, "tool_creation_state": self._tool_creation_state, "file_edit_approval_event": self._file_edit_approval_event, "file_edit_approval_state": self._file_edit_approval_state, "file_edit_pending_tasks": self._file_edit_pending_tasks, "file_edit_pending_lock": self._file_edit_pending_lock, "tool_approved": True, "active_thread_id": self._active_thread_id, "session_id": "", "set_mode": self.set_mode, "rebuild_graph": self._rebuild_graph, "planner_llm_factory": self._make_planner_llm_factory(), "executor_llm_factory": self._make_executor_llm_factory()}}
+            system_prompt = self._optimize_system_prompt(adapter.system_prompt, self.mode)
+            config = {"configurable": {"system_prompt": system_prompt + HALLUCINATION_GUARD, "token_queue": token_queue, "approval_event": self._human_approval_event, "approval_state": self._human_approval_state, "plan_approval_event": self._plan_approval_event, "plan_approval_state": self._plan_approval_state, "tool_creation_event": self._tool_creation_event, "tool_creation_state": self._tool_creation_state, "file_edit_approval_event": self._file_edit_approval_event, "file_edit_approval_state": self._file_edit_approval_state, "file_edit_pending_tasks": self._file_edit_pending_tasks, "file_edit_pending_lock": self._file_edit_pending_lock, "tool_approved": True, "active_thread_id": self._active_thread_id, "session_id": "", "set_mode": self.set_mode, "rebuild_graph": self._rebuild_graph, "planner_llm_factory": self._make_planner_llm_factory(), "executor_llm_factory": self._make_executor_llm_factory()}}
             worker_thread = threading.Thread(
                 target=self._file_edit_approval_worker,
                 daemon=True,

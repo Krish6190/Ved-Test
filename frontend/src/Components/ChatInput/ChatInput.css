@@ -1,0 +1,45 @@
+.chat-input-container {
+  display: flex;
+  align-items: center;
+  background-color: #1a1d29;
+  border: 1px solid #2d3247;
+  border-radius: 8px;
+  padding: 6px 12px;
+  margin: 16px;
+  gap: 12px;
+}
+
+.prompt-input {
+  flex: 1;
+  background: none;
+  border: none;
+  color: #fff;
+  font-size: 14px;
+  padding: 8px 0;
+  outline: none;
+}
+
+.prompt-input::placeholder {
+  color: #57606f;
+}
+
+.action-icon-btn {
+  background: none;
+  border: none;
+  font-size: 16px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 5px;
+  transition: background-color 0.2s;
+}
+
+.action-icon-btn:hover {
+  background-color: #232733;
+}
+
+.file-btn { color: #1e90ff; }
+.mic-btn { color: #ff4757; }

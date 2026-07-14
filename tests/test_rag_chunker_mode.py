@@ -24,6 +24,11 @@ import pytest
 import chatbot
 from chatbot import Chatbot
 from graph.rag.vector_engine import LocalVectorDB
+from graph.nodes.planner import planner_node
+from graph.nodes.executor import executor_node
+from graph.state import VedState
+from langchain_core.messages import SystemMessage
+from model_adapter import ModelAdapter
 
 
 # ---------------------------------------------------------------------------
@@ -174,3 +179,76 @@ def test_chatbot_rag_chunker_by_mode(make_chatbot):
     standard_bot = make_chatbot(mode="standard")
     assert standard_bot.mode == "standard"
     assert standard_bot._rag_chunker() == "text"
+
+
+def test_coder_mode_sanitizes_recommendation_payload(make_chatbot):
+    bot = make_chatbot(mode="coder")
+    bot.adapters["coder"] = ModelAdapter(
+        model_name="dummy",
+        device="cpu",
+        params={},
+        system_prompt=(
+            "You are Ved in coder mode.\n"
+            "RECOMMEND_CODER_MODE REASON: use coder mode for file edits.\n"
+            "Execute coder tasks directly."
+        ),
+    )
+
+    prompt = bot._sanitize_system_prompt(bot.adapters["coder"].system_prompt, bot.mode)
+    assert "RECOMMEND_CODER_MODE" not in prompt
+    assert "Execute coder tasks directly." in prompt
+
+
+def test_set_mode_coder_clears_legacy_recommendation_system_messages(make_chatbot):
+    bot = make_chatbot(mode="standard")
+    active_thread = bot.get_active_thread()
+    active_thread["messages"].append(SystemMessage(content="RECOMMEND_CODER_MODE REASON: should switch to coder"))
+
+    bot.set_mode("coder")
+    assert bot.mode == "coder"
+    assert not any(
+        isinstance(msg, SystemMessage)
+        and "RECOMMEND_CODER_MODE" in msg.content
+        for msg in active_thread["messages"]
+    )
+
+
+def test_compact_system_prompt_removes_duplicate_lines(make_chatbot):
+    bot = make_chatbot(mode="standard")
+    prompt = (
+        "You are Ved.\n\n"
+        "You are Ved.\n"
+        "Use tools only when needed.\n"
+        "Use tools only when needed.\n\n"
+        "Be concise."
+    )
+    compacted = bot._compact_system_prompt(prompt)
+    assert compacted.count("You are Ved.") == 1
+    assert compacted.count("Use tools only when needed.") == 1
+    assert "\n\n\n" not in compacted
+
+
+def test_planner_node_respects_summary_emitted():
+    state = VedState(
+        messages=[],
+        route_intent="P",
+        mode="standard",
+        active_thread_id="thr_test",
+        summary_emitted=True,
+    )
+    result = planner_node(state, lambda: None, None)
+    assert result["route_intent"] == "A"
+    assert result["messages"] == []
+
+
+def test_executor_node_respects_summary_emitted():
+    state = VedState(
+        messages=[],
+        route_intent="P",
+        mode="standard",
+        active_thread_id="thr_test",
+        summary_emitted=True,
+    )
+    result = executor_node(state, lambda: None, None)
+    assert result["route_intent"] == "A"
+    assert result["active_plan_id"] is None

@@ -110,6 +110,8 @@ class VedWidget(VedRagWorker):
             for child in btn.winfo_children(): child.config(bg=bg)
 
     def _on_enter(self, event):
+        if self.is_generating:
+            return
         threading.Thread(target=self._send_command, daemon=True).start()
 
     # ------------------------------------------------------------------ #
@@ -700,6 +702,8 @@ class VedWidget(VedRagWorker):
             self._append_text(f"[System Error] Failed to submit approval: {e}\n", MODE_COLORS["error"])
 
     def _send_command(self, prompt=None):
+        if self.is_generating:
+            return
         # Chunk C: an optional explicit prompt arg lets the voice processor
         if prompt is None:
             prompt = self.input_entry.get("1.0", tk.END).strip()

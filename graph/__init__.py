@@ -108,9 +108,18 @@ def build_graph(get_llm):
         {"executor_node": "executor_node", END: END},
     )
     # Executor runs one chunk as a self-contained agent loop (tools
-    # executed inline). It always returns to the planner — the planner
-    # reads the chunk output + structured tool_calls from the plan file.
-    g.add_edge("executor_node", "planner_node")
+    # executed inline). It returns to the planner only when a plan is still
+    # active and awaiting the next chunk. Otherwise the session ends.
+    def _route_after_executor(state: VedState) -> str:
+        if getattr(state, "route_intent", "") == "P" and getattr(state, "active_plan_id", None):
+            return "planner_node"
+        return END
+
+    g.add_conditional_edges(
+        "executor_node",
+        _route_after_executor,
+        {"planner_node": "planner_node", END: END},
+    )
 
     g.add_edge("content_pipeline_node", END)
     return g.compile()

@@ -1,0 +1,65 @@
+.title-bar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  background-color: #12141c;
+  padding: 8px 16px;
+  border-bottom: 1px solid #232733;
+  user-select: none;
+}
+
+.title-left {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.app-logo {
+  font-size: 14px;
+}
+
+.app-name {
+  font-weight: 700;
+  color: #fff;
+  letter-spacing: 1px;
+  font-size: 13px;
+}
+
+.directory-path {
+  font-family: 'Courier New', Courier, monospace;
+  font-size: 12px;
+  color: #636e72;
+  background-color: #1a1d29;
+  padding: 2px 8px;
+  border-radius: 4px;
+  border: 1px solid #2d3247;
+}
+
+.window-controls {
+  display: flex;
+  gap: 8px;
+}
+
+.control-btn {
+  background: none;
+  border: none;
+  color: #a4b0be;
+  cursor: pointer;
+  font-size: 12px;
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 4px;
+  transition: all 0.2s ease;
+}
+
+.control-btn:hover {
+  background-color: #232733;
+  color: #fff;
+}
+
+.close-btn:hover {
+  background-color: #ff4757;
+}

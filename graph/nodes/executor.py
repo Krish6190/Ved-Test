@@ -22,7 +22,7 @@ Difference from the previous design:
 from __future__ import annotations
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from data import plans as plan_store
@@ -241,10 +241,42 @@ def executor_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
     """
     plan_id = getattr(state, "active_plan_id", None)
     chunk_id = getattr(state, "current_chunk_id", None)
-    if not plan_id or not chunk_id:
+    current_step = getattr(state, "current_step", None)
+    # Backward-compat: the new lock uses `current_step`. Legacy callers
+    # (and existing tests) only set `current_chunk_id`. Use the lock as
+    # the authoritative chunk pointer when present, fall back to the
+    # legacy field otherwise.
+    effective_chunk_id = current_step if current_step is not None else chunk_id
+    lock_engaged = current_step is not None
+
+    if getattr(state, "summary_emitted", False):
         return {
             "messages": [],
-            "route_intent": state.route_intent, "mode": state.mode,
+            "route_intent": "A",
+            "mode": state.mode,
+            "active_plan_id": None,
+            "current_chunk_id": None,
+            "current_step": None,
+            "last_step_status": "",
+        }
+    if not plan_id or effective_chunk_id is None:
+        # No plan or no chunk to execute. If a plan is still active,
+        # route back to the planner so it can decide what's next; if no
+        # plan either, terminate this turn cleanly.
+        if plan_id:
+            return {
+                "messages": [],
+                "route_intent": "P",
+                "mode": state.mode,
+            }
+        return {
+            "messages": [],
+            "route_intent": "A",
+            "mode": state.mode,
+            "active_plan_id": None,
+            "current_chunk_id": None,
+            "current_step": None,
+            "last_step_status": "",
         }
 
     plan = plan_store.load_plan(plan_id)
@@ -253,11 +285,22 @@ def executor_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
             "messages": [],
             "route_intent": state.route_intent, "mode": state.mode,
         }
-    chunk = next((c for c in plan.get("chunks", []) if c["id"] == chunk_id), None)
+    chunk = next((c for c in plan.get("chunks", []) if c["id"] == effective_chunk_id), None)
     if chunk is None:
         return {
             "messages": [],
             "route_intent": state.route_intent, "mode": state.mode,
+        }
+
+    # Idempotency gate: when the lock is engaged (planner set
+    # `current_step`), the executor only runs a chunk that is currently
+    # in `executing` status. Any other status means the work has already
+    # been done (or never started) — pass through without re-running.
+    if lock_engaged and chunk.get("status") != "executing":
+        return {
+            "messages": [],
+            "route_intent": state.route_intent,
+            "mode": state.mode,
         }
 
     # ---- Dual-role Executor (Typist) handling ----
@@ -631,6 +674,8 @@ def executor_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
     # === Write to plan file ===
     output_text = last_content or ""
     success_messages: List[BaseMessage] = []
+    new_current_step: Optional[int] = current_step
+    new_last_step_status: str = getattr(state, "last_step_status", "")
     try:
         if last_error:
             _mark_failed_with_log(plan, chunk_id, last_error, structured_log)
@@ -639,6 +684,10 @@ def executor_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
                 i for i, c in enumerate(plan["chunks"]) if c["id"] == chunk_id
             )
             plan["chunks"][idx]["status"] = "pending"
+            # Lock: stay on the failed chunk so the planner can decide
+            # retry/skip; mark the last step as failed.
+            new_current_step = current_step
+            new_last_step_status = "failed"
             if token_queue is not None:
                 try:
                     token_queue.put(("plan_update", {
@@ -656,8 +705,13 @@ def executor_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
             nxt = plan_store.next_pending(plan)
             if nxt is None:
                 plan_store.set_waiting(plan, "Awaiting user approval of staged edits")
+                new_current_step = None
+                new_last_step_status = "staged_in_memory"
             else:
                 plan_store.mark_executing(plan, nxt["id"])
+                # Lock: hand the next chunk to the executor as dispatched.
+                new_current_step = nxt["id"]
+                new_last_step_status = "dispatched"
             if token_queue is not None:
                 try:
                     token_queue.put(("plan_update", {
@@ -674,17 +728,25 @@ def executor_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
             nxt = plan_store.next_pending(plan)
             if nxt is None:
                 plan_store.finalize(plan, "")
+                # Lock: no more chunks — the planner should write FINAL_SUMMARY.
+                new_current_step = None
+                new_last_step_status = "done"
             else:
                 plan_store.mark_executing(plan, nxt["id"])
+                # Lock: hand the next chunk to the executor as dispatched.
+                new_current_step = nxt["id"]
+                new_last_step_status = "dispatched"
         plan_store.save_plan(plan)
     except Exception:
         pass
 
     return {
         "messages": success_messages,
-        "route_intent": state.route_intent,
+        "route_intent": "P",
         "mode": state.mode,
         "chunk_retry_count": new_retry_count,
+        "current_step": new_current_step,
+        "last_step_status": new_last_step_status,
     }
 
 def _mark_failed_with_log(
