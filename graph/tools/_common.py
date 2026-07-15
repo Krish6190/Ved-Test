@@ -11,9 +11,12 @@ Centralizes:
 All four tools (`read_file`, `edit_file`, `overwrite_file`, `search_files`,
 `execute_python`) import from here to avoid duplication.
 """
+import json
 import os
 import re
+import threading
 from pathlib import Path
+from typing import Any, Dict
 
 from langchain_core.messages import HumanMessage
 
@@ -329,3 +332,201 @@ def resolve_implicit_python_code(state) -> str | None:
     if fence:
         return fence.group(1).strip()
     return None
+
+
+_RETRIEVE_RAG_PATH_KEYS = ("file_path", "path", "directory", "dir", "folder")
+
+
+def _normalize_retrieve_rag_args(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Map malformed retrieve_rag payloads onto the required ``query`` field."""
+    out = dict(args or {})
+    out.pop("config", None)
+
+    query = out.get("query")
+    if isinstance(query, str) and query.strip():
+        paths = out.get("paths")
+        if isinstance(paths, str) and paths.strip():
+            out["paths"] = [paths.strip()]
+        return out
+
+    derived = None
+    paths = out.get("paths")
+    if paths is not None:
+        if isinstance(paths, list):
+            derived = " ".join(str(p).strip() for p in paths if p)
+            out["paths"] = [str(p) for p in paths if p]
+        elif isinstance(paths, str) and paths.strip():
+            derived = paths.strip()
+            out["paths"] = [paths.strip()]
+
+    if not derived:
+        for key in _RETRIEVE_RAG_PATH_KEYS:
+            val = out.get(key)
+            if isinstance(val, str) and val.strip():
+                derived = val.strip()
+                break
+            if isinstance(val, list) and val:
+                derived = " ".join(str(v).strip() for v in val if v)
+                break
+
+    if not derived:
+        raw = out.get("_raw")
+        if isinstance(raw, str) and raw.strip():
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    return _normalize_retrieve_rag_args(parsed)
+            except Exception:
+                derived = raw.strip()
+
+    if not derived:
+        for key, val in out.items():
+            if key in ("k", "scope", "layer"):
+                continue
+            if isinstance(val, str) and val.strip():
+                derived = val.strip()
+                break
+
+    out["query"] = derived or "project files"
+    return out
+
+
+def normalize_tool_args(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize LLM tool-call args before Pydantic schema validation."""
+    if not isinstance(args, dict):
+        return {}
+    if tool_name == "retrieve_rag":
+        return _normalize_retrieve_rag_args(args)
+    return dict(args)
+
+
+def coerce_retrieve_rag_args(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Second-chance retrieve_rag normalization after a ValidationError."""
+    return _normalize_retrieve_rag_args(args or {})
+
+
+def ingest_path_to_thread_rag(path: str, thread_id: str) -> None:
+    """Trigger background ingestion of `path` into the thread-scoped RAG index.
+
+    Returns immediately; a daemon thread performs the actual embedding and
+    commit so the tool call is not blocked on the vector store. Failures
+    are swallowed — RAG ingestion is best-effort and must never break a
+    file read/search tool.
+    """
+    if not path or not thread_id:
+        return
+
+    def _run() -> None:
+        try:
+            from graph.rag.vector_engine import LocalVectorDB
+
+            db = LocalVectorDB()
+            db.ingest_local_file(
+                path,
+                scope=thread_id,
+                chunker="ast",
+                source=os.path.basename(path),
+            )
+        except Exception:
+            pass
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def ingest_path_to_thread_rag_sync(
+    path: str,
+    thread_id: str,
+    content: str | None = None,
+    *,
+    chunker: str = "ast",
+) -> None:
+    """Synchronously re-embed a file (or virtual text) into the thread RAG index.
+
+    Used by rollback so the thread index reflects the reverted virtual state
+    immediately instead of waiting on a background daemon thread.
+    """
+    if not thread_id:
+        return
+    try:
+        from graph.rag.vector_engine import LocalVectorDB
+
+        db = LocalVectorDB()
+        source = os.path.basename(path) if path else "staged_file"
+        if content is not None:
+            db.ingest_text(content, scope=thread_id, source=source, chunker=chunker)
+        elif path:
+            db.ingest_local_file(path, scope=thread_id, chunker=chunker, source=source)
+    except Exception:
+        pass
+
+
+def _resolve_fuzzy_path(path: str, base: Path | None = None) -> str | None:
+    """If `path` does not exist on disk, walk its components from the
+    closest existing ancestor and try to fix each one by substring
+    containment. Returns the corrected absolute path, or None when no
+    candidate qualifies.
+
+    Matching rule: a directory or file is a candidate when the provided
+    component appears as a contiguous substring of its name (case
+    insensitive). The shortest-name candidate wins (closest exact match).
+
+    Args:
+        path: A filesystem path string that may or may not exist.
+        base: Optional base directory to anchor from (defaults to cwd).
+
+    Returns:
+        The resolved absolute path of the closest matching entry, or None.
+    """
+    if not path:
+        return None
+    candidate = Path(path)
+    try:
+        if candidate.exists():
+            return str(candidate.resolve())
+    except OSError:
+        return None
+
+    # Find the closest existing ancestor of the candidate path
+    existing_ancestor = None
+    ancestors = list(candidate.parents)[::-1] + [candidate]
+    for anc in reversed(ancestors):
+        try:
+            if anc.exists():
+                existing_ancestor = anc
+                break
+        except OSError:
+            continue
+    if existing_ancestor is None:
+        return None
+
+    # Walk from existing_ancestor down, fuzzy-matching each component
+    # until we reach the candidate's level
+    try:
+        rel_to_ancestor = candidate.relative_to(existing_ancestor).parts
+    except ValueError:
+        rel_to_ancestor = candidate.parts
+
+    if not rel_to_ancestor:
+        return None
+
+    current = existing_ancestor
+    for part in rel_to_ancestor:
+        needle = part.lower()
+        if not needle:
+            return None
+        matches: list[Path] = []
+        try:
+            for entry in current.iterdir():
+                if needle in entry.name.lower():
+                    matches.append(entry)
+        except OSError:
+            return None
+        if not matches:
+            return None
+        best = min(matches, key=lambda e: len(e.name))
+        current = current / best.name
+
+    try:
+        return str(current.resolve()) if current.exists() else None
+    except OSError:
+        return None

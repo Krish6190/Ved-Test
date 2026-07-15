@@ -32,6 +32,7 @@ from graph.tools._common import (
     is_safe_default,
     is_safe_self_healing,
     last_user_message_text,
+    _resolve_fuzzy_path,
 )
 from graph.tools.staging_registry import STAGING_REGISTRY
 
@@ -78,6 +79,14 @@ def search_files(
         anchor = PROJECT_ROOT if self_healing else Path.cwd()
         base = anchor / base
 
+    # Fuzzy path resolution: if the exact directory doesn't exist,
+    # try to find a close match by searching from the anchor directory.
+    if not base.exists():
+        anchor = PROJECT_ROOT if self_healing else Path.cwd()
+        fuzzy = _resolve_fuzzy_path(str(base), base=anchor)
+        if fuzzy:
+            base = Path(fuzzy)
+
     safety = is_safe_self_healing if self_healing else is_safe_default
     if not safety(base):
         if self_healing:
@@ -103,6 +112,15 @@ def search_files(
 
     if not matches:
         return f"ERROR: No files matched '{pattern}' in '{base}'. Try a broader pattern."
+
+    from graph.tools._common import ingest_path_to_thread_rag
+
+    thread_id = getattr(state, "active_thread_id", "")
+    if thread_id:
+        for m in matches:
+            resolved_match = (base / m).resolve()
+            if resolved_match.is_file():
+                ingest_path_to_thread_rag(str(resolved_match), thread_id)
 
     mode_tag = " [SELF-HEALING MODE]" if self_healing else ""
     # Annotate paths that have a pending staged edit in this session.

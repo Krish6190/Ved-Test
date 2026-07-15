@@ -385,6 +385,11 @@ class VedWidget(VedRagWorker):
             bg="#f38ba8", fg="#1e1e2e", activebackground="#f5a3c3",
             bd=0, font=("Segoe UI", 8, "bold"), padx=6, cursor="hand2",
         ).pack(side="left", padx=(2, 0), expand=True, fill="x")
+        tk.Button(
+            per_file_btns, text="Revert", command=self._on_file_edit_revert_selected,
+            bg="#89b4fa", fg="#1e1e2e", activebackground="#9cc4ff",
+            bd=0, font=("Segoe UI", 8, "bold"), padx=6, cursor="hand2",
+        ).pack(side="bottom", fill="x", pady=(4, 0))
 
         # Right: diff preview
         diff_frame = tk.Frame(body, bg="#161b26")
@@ -565,6 +570,38 @@ class VedWidget(VedRagWorker):
         self._submit_file_edit_decision("reject", paths)
         self._remove_listbox_paths(paths)
         self._maybe_close_review_panel()
+
+    def _on_file_edit_revert_selected(self):
+        """Pop the newest staged version for the selected file and refresh UI."""
+        sel = self._file_edit_listbox.curselection()
+        if not sel:
+            return
+        path = self._file_edit_listbox.get(sel[0])
+        try:
+            ok = self.chatbot.submit_file_rollback(path)
+        except Exception as e:
+            self._append_text(
+                f"[System Error] Failed to revert staged edit for {path}: {e}\n",
+                MODE_COLORS["error"],
+            )
+            return
+        if not ok:
+            self._append_text(
+                f"[System] No earlier staged version available to revert for {path}.\n",
+                MODE_COLORS["error"],
+            )
+            return
+
+        thread_id = getattr(self.chatbot, "_file_edit_thread_id", None)
+        tasks = {}
+        if thread_id and STAGING_REGISTRY.has_session(thread_id):
+            try:
+                tasks = STAGING_REGISTRY.get_tasks(thread_id)
+            except Exception:
+                tasks = {}
+        if not tasks:
+            tasks = dict(getattr(self, "_file_edit_pending_tasks", {}) or {})
+        self._update_file_edit_review_panel(tasks)
 
     def _remove_listbox_paths(self, paths: list):
         """Delete specific paths from the review listbox.

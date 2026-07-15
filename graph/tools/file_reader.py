@@ -29,6 +29,7 @@ from graph.tools._common import (
     is_safe_default,
     is_safe_self_healing,
     resolve_implicit_target,
+    _resolve_fuzzy_path,
 )
 from graph.tools.staging_registry import STAGING_REGISTRY
 
@@ -67,6 +68,14 @@ def read_file(
         anchor = PROJECT_ROOT if self_healing else Path.cwd()
         candidate = anchor / candidate
 
+    # Fuzzy path resolution: if the exact path doesn't exist, try to find
+    # a close match by searching from the anchor directory.
+    if not candidate.exists():
+        anchor = PROJECT_ROOT if self_healing else Path.cwd()
+        fuzzy = _resolve_fuzzy_path(str(candidate), base=anchor)
+        if fuzzy:
+            candidate = Path(fuzzy)
+
     safety = is_safe_self_healing if self_healing else is_safe_default
     if not safety(candidate):
         if self_healing:
@@ -88,4 +97,6 @@ def read_file(
     if thread_id and STAGING_REGISTRY.has_session(thread_id):
         raw = STAGING_REGISTRY.get_overlay(thread_id, str(candidate.resolve()), raw)
 
+    from graph.tools._common import ingest_path_to_thread_rag
+    ingest_path_to_thread_rag(str(candidate.resolve()), thread_id)
     return raw

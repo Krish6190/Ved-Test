@@ -1046,6 +1046,43 @@ class Chatbot(ChatbotCommandProcessor):
         if event is not None:
             event.set()
 
+    def submit_file_rollback(self, file_path: str) -> bool:
+        """Revert the newest staged version for ``file_path`` in the active thread.
+
+        Pops the latest in-memory snapshot, promotes the previous virtual text,
+        mirrors the staging registry into the pending-task overlay, and
+        synchronously re-embeds the rolled-back content into thread RAG.
+        """
+        thread_id = getattr(self, "_active_thread_id", "") or ""
+        if not thread_id or not file_path:
+            return False
+
+        resolved_path = file_path
+        try:
+            resolved_path = str(Path(file_path).resolve())
+        except Exception:
+            resolved_path = file_path
+
+        result = STAGING_REGISTRY.rollback(thread_id, resolved_path)
+        if not result.get("ok"):
+            return False
+
+        with self._file_edit_pending_lock:
+            self._file_edit_pending_tasks.clear()
+            self._file_edit_pending_tasks.update(STAGING_REGISTRY.get_tasks(thread_id))
+
+        current_text = result.get("current_text")
+        if current_text is not None:
+            from graph.tools._common import ingest_path_to_thread_rag_sync
+
+            ingest_path_to_thread_rag_sync(
+                resolved_path,
+                thread_id,
+                content=current_text,
+                chunker=self._rag_chunker(),
+            )
+        return True
+
     def add_global_file(self, source_path: str) -> dict:
         """Add a file to the global store (accessible only via /upload-global).
 

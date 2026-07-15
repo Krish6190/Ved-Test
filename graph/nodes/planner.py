@@ -30,6 +30,7 @@ from graph.nodes._hints import _FRESH_QUESTION_HINT
 from graph.nodes._stream_helpers import _stream_text, _clean_chunk
 from graph.nodes.planner_diagnostics import escalate, EscalationAction
 from graph.state import VedState
+from graph.tools._common import coerce_retrieve_rag_args, normalize_tool_args
 from graph.tools.rag_retrieve import retrieve_rag
 
 # ---- Output marker parsing (unchanged) ----
@@ -142,7 +143,7 @@ _PLANNER_SYSTEM_BASE = (
     "  - Default to CREATE_PLAN for any tool/file/code/search request. DIRECT_ANSWER only for chitchat or facts.\n"
     "  - Each chunk instruction must be self-contained (action, target, context); the executor sees no history.\n"
     "  - Failure triage: REPLACE_CHUNK (executor mistake), SKIP_CHUNK (benign/broken tool), or STOP with FINAL_SUMMARY.\n"
-    "  - retrieve_rag scopes: scope=thread for past chat; paths=['dir/'] for a folder; no filter for generic search. Empty = use search_files.\n"
+    "  - retrieve_rag(query, paths=['dir/']) — query is always required; use paths only as an optional directory filter. Empty RAG = use search_files.\n"
     "  - Never call web_search for files in this project; it is not in your tool registry.\n"
 )
 
@@ -360,16 +361,19 @@ def _execute_planner_tool_call(
     """
     name = tool_call.get("name")
     if name == "retrieve_rag":
-        args = tool_call.get("args", {}) or {}
+        raw_args = tool_call.get("args", {}) or {}
+        args = normalize_tool_args(name, raw_args)
         query = args.get("query", "")
         scope = args.get("scope")
         k = args.get("k", 5)
         cache_key = f"{query}|{scope}|{k}"
         if call_cache is not None and cache_key in call_cache:
             return call_cache[cache_key]
-        # Config is injected by the framework; we pass it through so
-        # retrieve_rag can use the active thread's scope.
-        result = retrieve_rag.invoke(args, config=config)
+        try:
+            result = retrieve_rag.invoke(args, config=config)
+        except Exception:
+            retry_args = coerce_retrieve_rag_args(args)
+            result = retrieve_rag.invoke(retry_args, config=config)
         if call_cache is not None:
             call_cache[cache_key] = result
         return result

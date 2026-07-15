@@ -30,6 +30,7 @@ from graph.actions.filesystem import edit_file_action, overwrite_file_action
 from graph.state import VedState
 from graph.nodes._stream_helpers import _stream_text, _clean_chunk
 from graph.tools import PATH_A_EXECUTOR_TOOLS, VED_TOOLS, _assert_tool_isolation
+from graph.tools._common import coerce_retrieve_rag_args, normalize_tool_args
 from graph.tools.file_editor import overwrite_file, _resolve_and_check
 from graph.tools.file_reader import read_file
 from graph.tools.staging_registry import STAGING_REGISTRY
@@ -44,11 +45,11 @@ _TOOL_RESULT_MAX_CHARS = 1500       # truncate tool output so chunks stay small
 _TOOLS_NOTE_CODER = (
     "Available tools (full coder mode): read_file, edit_file, "
     "overwrite_file, search_files, execute_python, propose_tool, "
-    "open_app, retrieve_rag."
+    "open_app, retrieve_rag(query, paths=[...])."
 )
 _TOOLS_NOTE_STANDARD = (
     "Available tools (standard mode, NO code execution): "
-    "read_file, search_files, retrieve_rag, open_app."
+    "read_file, search_files, retrieve_rag(query, paths=[...]), open_app."
 )
 
 _FILE_EDITING_RULES = (
@@ -147,10 +148,28 @@ def _apply_pending_read_overlay(
         return raw_content
 
 
-def _invoke_tool_sync(tool, args: dict) -> Tuple[str, bool]:
+def _invoke_tool_sync(tool, args: dict, config=None) -> Tuple[str, bool]:
     """Invoke a LangChain tool synchronously. Returns (result_text, ok)."""
+    tool_name = getattr(tool, "name", "") or ""
+    normalized = normalize_tool_args(tool_name, args)
     try:
-        result = tool.invoke(args)
+        if config is not None:
+            result = tool.invoke(normalized, config=config)
+        else:
+            result = tool.invoke(normalized)
+    except Exception as exc:
+        if tool_name == "retrieve_rag":
+            try:
+                retry_args = coerce_retrieve_rag_args(normalized)
+                if config is not None:
+                    result = tool.invoke(retry_args, config=config)
+                else:
+                    result = tool.invoke(retry_args)
+            except Exception as retry_exc:
+                return f"ERROR: {type(retry_exc).__name__}: {retry_exc}", False
+        else:
+            return f"ERROR: {type(exc).__name__}: {exc}", False
+    try:
         s = result if isinstance(result, str) else str(result)
         if len(s) > _TOOL_RESULT_MAX_CHARS:
             s = s[:_TOOL_RESULT_MAX_CHARS] + f"\n...[truncated at {_TOOL_RESULT_MAX_CHARS} chars]"
@@ -380,6 +399,14 @@ def executor_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
                 "preview": {"old": code_snippet[:_PREVIEW_MAX_CHARS], "new": generated_code[:_PREVIEW_MAX_CHARS]},
                 "tasks": dict(tasks),
             })
+            return {
+                "messages": [],
+                "route_intent": "P",
+                "mode": state.mode,
+                "dual_role_phase": "awaiting_user_approval",
+                "plan_executed": True,
+                "executor_generated_code": generated_code,
+            }
         return {
             "messages": [],
             "route_intent": "P",
@@ -546,11 +573,20 @@ def executor_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
                 with file_edit_pending_lock:
                     file_edit_pending_tasks[task_path] = task
                 if thread_id and STAGING_REGISTRY.has_session(thread_id):
-                    try:
-                        with STAGING_REGISTRY._get_session(thread_id).lock:  # noqa: SLF001
-                            STAGING_REGISTRY._get_session(thread_id).tasks[task_path] = task  # noqa: SLF001
-                    except Exception:
-                        pass
+                    result_text = STAGING_REGISTRY.stage_edit(
+                        thread_id,
+                        tool_name,
+                        resolved_path,
+                        args_copy,
+                        task["preview"],
+                    )
+                else:
+                    result_text = (
+                        f"Pending approval: {tool_name} on {resolved_path}. "
+                        f"Awaiting user decision in the file-edit review panel."
+                    )
+                ok = True
+                staged_a_file_edit = True
                 payload = {
                     "path": task_path,
                     "operation": "edit" if tool_name == "edit_file" else "overwrite",
@@ -558,16 +594,11 @@ def executor_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
                     "tasks": dict(file_edit_pending_tasks),
                     "thread_id": thread_id,
                 }
+                if thread_id and STAGING_REGISTRY.has_session(thread_id):
+                    payload["tasks"] = STAGING_REGISTRY.get_tasks(thread_id)
                 _emit_file_edit_approval_request(token_queue, payload)
-                result_text = (
-                    f"Pending approval: {tool_name} on {resolved_path}. "
-                    f"Awaiting user decision in the file-edit review panel."
-                )
-                ok = True
-                staged_a_file_edit = True
             elif tc["name"] == "read_file" and has_approval_infra:
-                # Legacy read overlay using the in-memory pending dict.
-                result_text, ok = _invoke_tool_sync(tool, tc["args"])
+                result_text, ok = _invoke_tool_sync(tool, tc["args"], config=config)
                 if ok:
                     try:
                         path_str = tc["args"].get("path", "") or ""
@@ -580,15 +611,20 @@ def executor_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
                         except Exception:
                             resolved_path = path_str
                         resolved_path = str(Path(resolved_path).resolve()) if resolved_path else resolved_path
-                        result_text = _apply_pending_read_overlay(
-                            resolved_path, result_text,
-                            file_edit_pending_tasks,
-                            file_edit_pending_lock,
-                        )
+                        if thread_id and STAGING_REGISTRY.has_session(thread_id):
+                            result_text = STAGING_REGISTRY.get_overlay(
+                                thread_id, resolved_path, result_text,
+                            )
+                        else:
+                            result_text = _apply_pending_read_overlay(
+                                resolved_path, result_text,
+                                file_edit_pending_tasks,
+                                file_edit_pending_lock,
+                            )
                     except Exception:
                         pass
             else:
-                result_text, ok = _invoke_tool_sync(tool, tc["args"])
+                result_text, ok = _invoke_tool_sync(tool, tc["args"], config=config)
             if ok and isinstance(result_text, str) and result_text.startswith("STAGED:"):
                 path_str = tc["args"].get("path", "") or ""
                 operation = "edit" if tc["name"] == "edit_file" else "overwrite"
@@ -742,7 +778,7 @@ def executor_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
     except Exception:
         pass
 
-    return {
+    updates = {
         "messages": success_messages,
         "route_intent": "P",
         "mode": state.mode,
@@ -750,6 +786,10 @@ def executor_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
         "current_step": new_current_step,
         "last_step_status": new_last_step_status,
     }
+    if staged_a_file_edit:
+        updates["dual_role_phase"] = "awaiting_user_approval"
+        updates["plan_executed"] = True
+    return updates
 
 def _mark_failed_with_log(
     plan: Dict[str, Any],

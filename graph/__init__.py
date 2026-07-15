@@ -8,12 +8,39 @@ from .nodes.simple_chat import simple_chat_node
 from .nodes.planner import planner_node
 from .nodes.executor import executor_node
 from .content_generation.pipeline_node import content_pipeline_node
+from .tools.staging_registry import STAGING_REGISTRY
 
 
 def hibernate_node(state: VedState, get_llm, config) -> dict:
     return {
         "messages": [AIMessage(content="Ved is hibernating. Type /wake to resume.")],
         "route_intent": state.route_intent, "mode": state.mode,
+    }
+
+
+def staging_gate_node(state: VedState, get_llm, config) -> dict:
+    """First node after START. Inspects STAGING_REGISTRY and decides:
+      - If pending edits exist for the active thread: set terminal flags
+        (plan_executed=True, dual_role_phase="awaiting_user_approval") so the
+        graph terminates and the UI re-renders the review window. The
+        Planner is never invoked.
+      - If no pending edits: reset the flags so the Planner (if reached)
+        behaves normally.
+    """
+    thread_id = getattr(state, "active_thread_id", "") or ""
+    pending = False
+    if thread_id and STAGING_REGISTRY.has_session(thread_id):
+        pending = bool(STAGING_REGISTRY.get_tasks(thread_id))
+
+    if pending:
+        return {
+            "plan_executed": True,
+            "dual_role_phase": "awaiting_user_approval",
+            "route_intent": "A",
+        }
+    return {
+        "plan_executed": False,
+        "dual_role_phase": "",
     }
 
 
@@ -27,6 +54,55 @@ def _route_after_planner(state: VedState) -> str:
     intent = getattr(state, "route_intent", "")
     if intent == "P":
         return "executor_node"
+    return END
+
+
+def _start_router(state: VedState) -> str:
+    """Route from START. If pending staged edits exist, route through
+    staging_gate_node to force terminal pause; otherwise route normally
+    based on mode."""
+    thread_id = getattr(state, "active_thread_id", "") or ""
+    if thread_id and STAGING_REGISTRY.has_session(thread_id):
+        if STAGING_REGISTRY.get_tasks(thread_id):
+            return "staging_gate_node"
+    return {
+        "hibernate": "hibernate_node",
+        "standard": "simple_chat_node",
+        "turbo": "intent_router_node",
+        "coder": "planner_node",
+    }.get(state.mode, "simple_chat_node")
+
+
+def _route_after_staging_gate(state: VedState) -> str:
+    """Route after staging_gate_node. If terminal flags were set, go to END;
+    otherwise route to the normal mode-based destination."""
+    if getattr(state, "dual_role_phase", "") == "awaiting_user_approval":
+        return END
+    mode = getattr(state, "mode", "standard")
+    return {
+        "hibernate": "hibernate_node",
+        "standard": "simple_chat_node",
+        "turbo": "intent_router_node",
+        "coder": "planner_node",
+    }.get(mode, "simple_chat_node")
+
+
+def _route_after_executor(state: VedState) -> str:
+    """Conditional edge after `executor_node`.
+
+    Routes:
+      - END when the executor has staged edits awaiting user approval
+        (`plan_executed` True or `dual_role_phase` == "awaiting_user_approval").
+      - planner_node when a plan is still active and no terminal approval
+        state is set.
+      - END otherwise.
+    """
+    if getattr(state, "plan_executed", False):
+        return END
+    if getattr(state, "dual_role_phase", "") == "awaiting_user_approval":
+        return END
+    if getattr(state, "route_intent", "") == "P" and getattr(state, "active_plan_id", None):
+        return "planner_node"
     return END
 
 
@@ -60,6 +136,7 @@ def _route_after_intent(state: VedState) -> str:
 
 def build_graph(get_llm):
     g = StateGraph(VedState)
+    g.add_node("staging_gate_node", lambda state, config: staging_gate_node(state, get_llm, config))
     g.add_node("intent_router_node", lambda state, config: intent_router_node(state, get_llm))
     g.add_node("standalone_chat_node", lambda state, config: standalone_chat_node(state, get_llm, config))
     g.add_node("simple_chat_node", lambda state, config: simple_chat_node(state, get_llm, config))
@@ -70,17 +147,24 @@ def build_graph(get_llm):
 
     g.add_conditional_edges(
         START,
-        lambda state: {
-            "hibernate": "hibernate_node",
-            "standard": "simple_chat_node",
-            "turbo": "intent_router_node",
-            "coder": "planner_node",
-        }.get(state.mode, "simple_chat_node"),
+        _start_router,
+        {
+            "staging_gate_node": "staging_gate_node",
+            "hibernate_node": "hibernate_node",
+            "simple_chat_node": "simple_chat_node",
+            "intent_router_node": "intent_router_node",
+            "planner_node": "planner_node",
+        },
+    )
+    g.add_conditional_edges(
+        "staging_gate_node",
+        _route_after_staging_gate,
         {
             "hibernate_node": "hibernate_node",
             "simple_chat_node": "simple_chat_node",
             "intent_router_node": "intent_router_node",
             "planner_node": "planner_node",
+            END: END,
         },
     )
     # Route Path A based on mode: non-coder skips the planner, coder keeps it.
@@ -110,11 +194,6 @@ def build_graph(get_llm):
     # Executor runs one chunk as a self-contained agent loop (tools
     # executed inline). It returns to the planner only when a plan is still
     # active and awaiting the next chunk. Otherwise the session ends.
-    def _route_after_executor(state: VedState) -> str:
-        if getattr(state, "route_intent", "") == "P" and getattr(state, "active_plan_id", None):
-            return "planner_node"
-        return END
-
     g.add_conditional_edges(
         "executor_node",
         _route_after_executor,

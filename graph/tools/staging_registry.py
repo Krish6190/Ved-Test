@@ -12,8 +12,38 @@ multiple concurrent conversations do not collide.
 """
 from __future__ import annotations
 
+from pathlib import Path
 from threading import Lock
 from typing import Any, Callable, Dict, List, Optional
+
+_MAX_VERSIONS = 5
+
+
+def _read_disk_text(resolved_path: str) -> str:
+    try:
+        return Path(resolved_path).read_text(encoding="utf-8")
+    except Exception:
+        return ""
+
+
+def _apply_task_to_text(base_text: str, task: Dict[str, Any]) -> str:
+    """Apply one staged edit task onto ``base_text`` and return virtual file text."""
+    args = task.get("args", {}) or {}
+    tool_name = task.get("tool_name", "")
+    if tool_name == "edit_file":
+        old_text = args.get("old_text", "") or ""
+        new_text = args.get("new_text", "") or ""
+        if old_text and old_text in base_text:
+            return base_text.replace(old_text, new_text, 1)
+        return base_text + (
+            "\n\n[VIRTUAL OVERLAY WARNING] Pending edit_file old_text "
+            "no longer matches this file's staged content; the virtual "
+            "overlay was not applied. Read the file again or re-issue "
+            "the edit with a matching old_text."
+        )
+    if tool_name == "overwrite_file":
+        return args.get("content", "") or ""
+    return base_text
 
 
 class _Session:
@@ -27,8 +57,7 @@ class _Session:
         self.approval_event = approval_event
         self.approval_state = approval_state
         self.tasks: Dict[str, Dict[str, Any]] = {}
-        self.task_history: Dict[str, List[Dict[str, Any]]] = {}
-        self.overlay_texts: Dict[str, str] = {}
+        self.code_versions: Dict[str, List[str]] = {}
         self.lock = Lock()
 
 
@@ -97,9 +126,16 @@ class StagingRegistry:
             "preview": dict(preview),
         }
         with session.lock:
+            versions = session.code_versions.setdefault(resolved_path, [])
+            if versions:
+                base = versions[-1]
+            else:
+                base = _read_disk_text(resolved_path)
+            new_text = _apply_task_to_text(base, task)
+            versions.append(new_text)
+            while len(versions) > _MAX_VERSIONS:
+                versions.pop(0)
             session.tasks[resolved_path] = task
-            session.task_history.setdefault(resolved_path, []).append(task)
-        # Signal the worker thread that a decision may be waiting.
         if session.approval_event is not None:
             try:
                 session.approval_event.set()
@@ -111,46 +147,19 @@ class StagingRegistry:
         )
 
     def get_overlay(self, thread_id: str, resolved_path: str, raw_content: str) -> str:
-        """Return `raw_content` with all staged edits for this path applied.
+        """Return the latest virtual file text for a staged path.
 
-        The overlay is cumulative and always prefers the staged in-memory
-        view over stale on-disk content. If a staged edit cannot be applied
-        (for example an earlier edit_file old_text no longer matches), the
-        overlay falls back to the current virtual content and appends a
-        warning marker so the model sees the mismatch explicitly.
+        Always pivots on ``code_versions[path][-1]`` when versions exist.
         """
         session = self._get_session(thread_id)
         if session is None:
             return raw_content
 
         with session.lock:
-            history = session.task_history.get(resolved_path) or []
-            if not history:
-                return raw_content
-
-            overlay = session.overlay_texts.get(resolved_path, raw_content)
-            for task in history:
-                args = task.get("args", {}) or {}
-                tool_name = task.get("tool_name", "")
-                if tool_name == "edit_file":
-                    old_text = args.get("old_text", "") or ""
-                    new_text = args.get("new_text", "") or ""
-                    if old_text and old_text in overlay:
-                        overlay = overlay.replace(old_text, new_text, 1)
-                    else:
-                        overlay = overlay + (
-                            "\n\n[VIRTUAL OVERLAY WARNING] Pending edit_file old_text "
-                            "no longer matches this file's staged content; the virtual "
-                            "overlay was not applied. Read the file again or re-issue "
-                            "the edit with a matching old_text."
-                        )
-                elif tool_name == "overwrite_file":
-                    overlay = args.get("content", "") or ""
-                else:
-                    overlay = overlay
-
-            session.overlay_texts[resolved_path] = overlay
-            return overlay
+            versions = session.code_versions.get(resolved_path) or []
+            if versions:
+                return versions[-1]
+            return raw_content
 
     def get_tasks(self, thread_id: str) -> Dict[str, Dict[str, Any]]:
         """Return a snapshot of the staged tasks for a session."""
@@ -159,6 +168,57 @@ class StagingRegistry:
             return {}
         with session.lock:
             return dict(session.tasks)
+
+    def get_version_count(self, thread_id: str, resolved_path: str) -> int:
+        """Return how many in-memory versions are stored for a staged path."""
+        session = self._get_session(thread_id)
+        if session is None:
+            return 0
+        with session.lock:
+            return len(session.code_versions.get(resolved_path) or [])
+
+    def rollback(self, thread_id: str, resolved_path: str) -> Dict[str, Any]:
+        """Pop the newest staged version and expose the previous virtual text.
+
+        Returns a dict with keys:
+          - ok (bool)
+          - remaining_versions (int)
+          - current_text (str | None)
+        """
+        session = self._get_session(thread_id)
+        result: Dict[str, Any] = {
+            "ok": False,
+            "remaining_versions": 0,
+            "current_text": None,
+        }
+        if session is None:
+            return result
+
+        with session.lock:
+            versions = session.code_versions.get(resolved_path) or []
+            if len(versions) <= 1:
+                return result
+
+            versions.pop()
+            current = versions[-1]
+            session.code_versions[resolved_path] = versions
+            task = session.tasks.get(resolved_path, {})
+            if task:
+                task = dict(task)
+                task["tool_name"] = "overwrite_file"
+                task["args"] = {
+                    "path": resolved_path,
+                    "content": current,
+                }
+                preview = dict(task.get("preview", {}) or {})
+                preview["new"] = current[:300]
+                task["preview"] = preview
+                session.tasks[resolved_path] = task
+
+            result["ok"] = True
+            result["remaining_versions"] = len(versions)
+            result["current_text"] = current
+            return result
 
     def apply_decision(
         self,
@@ -194,29 +254,25 @@ class StagingRegistry:
             if action == "approve_all":
                 approved_tasks = list(snapshot.values())
                 session.tasks.clear()
-                session.task_history.clear()
-                session.overlay_texts.clear()
+                session.code_versions.clear()
             elif action == "reject_all":
                 rejected_tasks = list(snapshot.values())
                 session.tasks.clear()
-                session.task_history.clear()
-                session.overlay_texts.clear()
+                session.code_versions.clear()
             elif action == "approve":
                 for p in paths:
                     t = snapshot.get(p)
                     if t is not None:
                         approved_tasks.append(t)
                         session.tasks.pop(p, None)
-                        session.task_history.pop(p, None)
-                        session.overlay_texts.pop(p, None)
+                        session.code_versions.pop(p, None)
             else:  # reject / unknown
                 for p in paths:
                     t = snapshot.get(p)
                     if t is not None:
                         rejected_tasks.append(t)
                         session.tasks.pop(p, None)
-                        session.task_history.pop(p, None)
-                        session.overlay_texts.pop(p, None)
+                        session.code_versions.pop(p, None)
 
         for task in approved_tasks:
             try:

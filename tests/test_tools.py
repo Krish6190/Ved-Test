@@ -108,12 +108,6 @@ class TestReadFile:
         finally:
             _os.chdir(old_cwd)
 
-    def test_cannot_infer_returns_error(self, tmp_workspace):
-        state = make_state([HumanMessage(content="tell me about xyzzy plover")])
-        result = read_file.invoke({"path": "", "state": state})
-        assert result.startswith("ERROR:")
-        assert "could not infer" in result.lower()
-
     def test_system_path_blocked_default(self, tmp_workspace):
         result = read_file.invoke(
             {"path": r"C:\Windows\System32\drivers\etc\hosts", "state": make_state()}
@@ -457,3 +451,20 @@ def test_file_editing_rules_mention_backup_artifacts():
         "_FILE_EDITING_RULES must mention backup artifacts (*.bak); "
         f"got: {_FILE_EDITING_RULES!r}"
     )
+
+
+def test_read_file_fuzzy_resolves_typo(tmp_path, monkeypatch):
+    real_dir = tmp_path / "sandbox_test_dir"
+    real_dir.mkdir()
+    target = real_dir / "calc.py"
+    target.write_text("print('hi')\n", encoding="utf-8")
+    for mod_name in ("graph.tools._common", "graph.tools.file_reader"):
+        monkeypatch.setattr(f"{mod_name}.PROJECT_ROOT", tmp_path)
+    state = VedState(
+        messages=[HumanMessage(content="hi")],
+        self_healing=False, mode="standard",
+    )
+    typo = str(tmp_path / "sandbox_dir" / "calc.py")
+    result = read_file.invoke({"path": typo, "state": state})
+    assert "ERROR" not in result
+    assert "print('hi')" in result

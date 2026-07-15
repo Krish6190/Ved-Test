@@ -49,7 +49,8 @@ class VedState(BaseModel):
     final_summary: Optional[str] = Field(default=None)
     summary_emitted: bool = Field(default=False)
     active_thread_id: str = Field(default="")
-    dual_role_phase: Literal["", "analyze", "execute", "stage"] = Field(default="")
+    dual_role_phase: Literal["", "analyze", "execute", "stage", "awaiting_user_approval"] = Field(default="")
+    plan_executed: bool = Field(default=False)
     fix_instruction: str = Field(default="")  # PLANNER_OUTPUT
     target_file_path: str = Field(default="")
     target_file_content: str = Field(default="")  # raw code snippet

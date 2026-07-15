@@ -314,3 +314,33 @@ def test_executor_handles_unknown_tool_gracefully(tmp_path, monkeypatch):
     assert "unknown tool" in chunk1["output"]
     assert chunk1["tool_calls"][0]["name"] == "nonexistent_tool"
     assert chunk1["tool_calls"][0]["ok"] is False
+
+
+# ---- terminal flag regression (Task 5) ----
+
+def test_executor_sets_terminal_flags_when_file_edit_is_staged(tmp_path, monkeypatch):
+    """After staging a file edit, executor_node must set plan_executed=True
+    and dual_role_phase='awaiting_user_approval' so the graph does not loop."""
+    plan = _setup_plan(tmp_path, monkeypatch, chunks=["edit foo.py"])
+    cfg, _ = _make_config()
+
+    monkeypatch.setattr(
+        executor_mod, "_stream_one_iteration",
+        lambda *a, **kw: ("editing", [{
+            "id": "c1", "name": "edit_file",
+            "args": {"path": "foo.py", "old_text": "old", "new_text": "new"},
+        }]),
+    )
+    monkeypatch.setattr(
+        executor_mod, "_invoke_tool_sync",
+        lambda *a, **kw: ("STAGED: awaiting approval", True),
+    )
+
+    state = _FakeState(plan["plan_id"], 1, mode="coder")
+    result = executor_mod.executor_node(
+        state,
+        get_llm=lambda: _FakeLLM(), config=cfg,
+    )
+
+    assert result.get("plan_executed") is True
+    assert result.get("dual_role_phase") == "awaiting_user_approval"

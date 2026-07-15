@@ -194,29 +194,31 @@ def test_emit_file_edit_approval_request_handles_none_queue():
     assert "/tmp/y.py" in tasks
 
 
-def test_staging_registry_applies_multiple_edits_cumulatively():
+def test_staging_registry_applies_multiple_edits_cumulatively(tmp_path):
     """Repeated staged edits for the same file should compose into one
     virtual overlay rather than reverting to stale disk state."""
     from graph.tools.staging_registry import STAGING_REGISTRY
 
     thread_id = "thr_overlay_sequence"
+    target = tmp_path / "overlay.py"
+    target.write_text("alpha", encoding="utf-8")
     STAGING_REGISTRY.register_session(thread_id)
     try:
         STAGING_REGISTRY.stage_edit(
             thread_id,
             "edit_file",
-            "/tmp/overlay.py",
-            {"path": "/tmp/overlay.py", "old_text": "alpha", "new_text": "beta"},
+            str(target),
+            {"path": str(target), "old_text": "alpha", "new_text": "beta"},
             {"old": "alpha", "new": "beta"},
         )
         STAGING_REGISTRY.stage_edit(
             thread_id,
             "edit_file",
-            "/tmp/overlay.py",
-            {"path": "/tmp/overlay.py", "old_text": "beta", "new_text": "gamma"},
+            str(target),
+            {"path": str(target), "old_text": "beta", "new_text": "gamma"},
             {"old": "beta", "new": "gamma"},
         )
-        overlay = STAGING_REGISTRY.get_overlay(thread_id, "/tmp/overlay.py", "alpha")
+        overlay = STAGING_REGISTRY.get_overlay(thread_id, str(target), "alpha")
         assert overlay == "gamma", overlay
     finally:
         STAGING_REGISTRY.unregister_session(thread_id)
