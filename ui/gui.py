@@ -660,6 +660,9 @@ class VedWidget(VedRagWorker):
                 return
             if panel.winfo_exists():
                 panel.withdraw()
+                thread_id = getattr(self.chatbot, "_file_edit_thread_id", None)
+                if thread_id:
+                    STAGING_REGISTRY.reset_announced_paths(thread_id)
         except Exception:
             pass
 
@@ -682,6 +685,9 @@ class VedWidget(VedRagWorker):
                     panel.destroy()
                 except Exception:
                     pass
+                thread_id = getattr(self.chatbot, "_file_edit_thread_id", None)
+                if thread_id:
+                    STAGING_REGISTRY.reset_announced_paths(thread_id)
         except Exception:
             pass
 
@@ -1084,10 +1090,6 @@ class VedWidget(VedRagWorker):
 def main():
     root = tk.Tk()
     widget = VedWidget(root)
-
-    # Telemetry: end the active-user session when the window is closed
-    # (either via WM_DELETE_WINDOW or a normal mainloop exit). Bound
-    # before mainloop so the close handler always fires.
     def _on_close():
         try:
             if _telemetry is not None:

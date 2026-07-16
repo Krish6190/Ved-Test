@@ -97,6 +97,6 @@ def read_file(
     if thread_id and STAGING_REGISTRY.has_session(thread_id):
         raw = STAGING_REGISTRY.get_overlay(thread_id, str(candidate.resolve()), raw)
 
-    from graph.tools._common import ingest_path_to_thread_rag
-    ingest_path_to_thread_rag(str(candidate.resolve()), thread_id)
+    from graph.tools._common import ingest_path_to_thread_rag_sync
+    ingest_path_to_thread_rag_sync(str(candidate.resolve()), thread_id, chunker="ast")
     return raw

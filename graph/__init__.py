@@ -74,10 +74,13 @@ def _start_router(state: VedState) -> str:
 
 
 def _route_after_staging_gate(state: VedState) -> str:
-    """Route after staging_gate_node. If terminal flags were set, go to END;
-    otherwise route to the normal mode-based destination."""
+    """Route after staging_gate_node.
+
+    Pending staged edits must not bypass the planner. The planner owns
+    the final summary and the only transition to END.
+    """
     if getattr(state, "dual_role_phase", "") == "awaiting_user_approval":
-        return END
+        return "planner_node"
     mode = getattr(state, "mode", "standard")
     return {
         "hibernate": "hibernate_node",
@@ -91,16 +94,15 @@ def _route_after_executor(state: VedState) -> str:
     """Conditional edge after `executor_node`.
 
     Routes:
-      - END when the executor has staged edits awaiting user approval
-        (`plan_executed` True or `dual_role_phase` == "awaiting_user_approval").
-      - planner_node when a plan is still active and no terminal approval
-        state is set.
+      - planner_node when the executor has staged edits awaiting user
+        approval (`plan_executed` True or `dual_role_phase` ==
+        "awaiting_user_approval"). This gives the Planner structural
+        space to emit a FINAL_SUMMARY before the graph transitions to END.
+      - planner_node when a plan is still active and more work remains.
       - END otherwise.
     """
-    if getattr(state, "plan_executed", False):
-        return END
-    if getattr(state, "dual_role_phase", "") == "awaiting_user_approval":
-        return END
+    if getattr(state, "plan_executed", False) or getattr(state, "dual_role_phase", "") == "awaiting_user_approval":
+        return "planner_node"
     if getattr(state, "route_intent", "") == "P" and getattr(state, "active_plan_id", None):
         return "planner_node"
     return END

@@ -31,7 +31,7 @@ def limit_messages(left: Sequence[BaseMessage], right: Sequence[BaseMessage]) ->
 
 class VedState(BaseModel):
     messages: Annotated[Sequence[BaseMessage], limit_messages]
-    route_intent: Literal["A", "B", "C", "P", ""] = Field(default="")
+    route_intent: Literal["A", "B", "C", "P", "P_FINALIZE", ""] = Field(default="")
     current_draft: str = Field(default="")
     critique_notes: str = Field(default="")
     content_score: int = Field(default=0)
@@ -46,10 +46,11 @@ class VedState(BaseModel):
     current_chunk_id: Optional[int] = Field(default=None)
     current_step: Optional[int] = Field(default=None)
     last_step_status: Literal["", "dispatched", "done", "failed", "staged_in_memory"] = Field(default="")
+    completed_checkpoints: list[str] = Field(default_factory=list)
     final_summary: Optional[str] = Field(default=None)
     summary_emitted: bool = Field(default=False)
     active_thread_id: str = Field(default="")
-    dual_role_phase: Literal["", "analyze", "execute", "stage", "awaiting_user_approval"] = Field(default="")
+    dual_role_phase: Literal["", "read_target", "analyze", "execute", "stage", "awaiting_user_approval"] = Field(default="")
     plan_executed: bool = Field(default=False)
     fix_instruction: str = Field(default="")  # PLANNER_OUTPUT
     target_file_path: str = Field(default="")

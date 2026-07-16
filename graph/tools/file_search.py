@@ -113,14 +113,14 @@ def search_files(
     if not matches:
         return f"ERROR: No files matched '{pattern}' in '{base}'. Try a broader pattern."
 
-    from graph.tools._common import ingest_path_to_thread_rag
+    from graph.tools._common import ingest_path_to_thread_rag_sync
 
     thread_id = getattr(state, "active_thread_id", "")
     if thread_id:
         for m in matches:
             resolved_match = (base / m).resolve()
             if resolved_match.is_file():
-                ingest_path_to_thread_rag(str(resolved_match), thread_id)
+                ingest_path_to_thread_rag_sync(str(resolved_match), thread_id, chunker="ast")
 
     mode_tag = " [SELF-HEALING MODE]" if self_healing else ""
     # Annotate paths that have a pending staged edit in this session.

@@ -660,11 +660,16 @@ class Chatbot(ChatbotCommandProcessor):
                 "content_score": 0,
                 "loop_count": 0,
                 "active_thread_id": thread_id,
+                "active_plan_id": self._active_plan_id,
+                "current_chunk_id": self._graph_state_current_step,
                 # Transition-lock seeds — these reset the planner/executor
                 # handshake to a clean baseline so each respond() call
                 # starts with no in-flight chunk dispatch.
-                "current_step": None,
-                "last_step_status": "",
+                "current_step": self._graph_state_current_step,
+                "last_step_status": self._graph_state_last_step_status or "",
+                "summary_emitted": False,
+                "plan_executed": False,
+                "dual_role_phase": "",
             }
             token_queue = queue.Queue()
             self._human_approval_event = threading.Event()
@@ -809,7 +814,7 @@ class Chatbot(ChatbotCommandProcessor):
         diff_store = getattr(self, "_diff_history_store", None)
         try:
             if tool_name == "edit_file":
-                return edit_file_action(
+                result = edit_file_action(
                     args.get("path", ""),
                     args.get("old_text", ""),
                     args.get("new_text", ""),
@@ -818,14 +823,28 @@ class Chatbot(ChatbotCommandProcessor):
                     diff_history_store=diff_store,
                 )
             elif tool_name == "overwrite_file":
-                return overwrite_file_action(
+                result = overwrite_file_action(
                     args.get("path", ""),
                     args.get("content", ""),
                     allowed_roots=(project_root,),
                     backup_dir=None,
                     diff_history_store=diff_store,
                 )
-            return f"ERROR: unknown file-edit tool '{tool_name}'"
+            else:
+                return f"ERROR: unknown file-edit tool '{tool_name}'"
+
+            if not isinstance(result, str) or not result.startswith("ERROR:"):
+                try:
+                    from graph.tools._common import ingest_path_to_thread_rag_sync
+
+                    ingest_path_to_thread_rag_sync(
+                        args.get("path", ""),
+                        getattr(self, "_file_edit_thread_id", ""),
+                        chunker=self._rag_chunker(),
+                    )
+                except Exception:
+                    pass
+            return result
         except Exception as exc:
             return f"ERROR: {type(exc).__name__}: {exc}"
 

@@ -625,7 +625,9 @@ def executor_node(state: VedState, get_llm, config: RunnableConfig) -> dict:
                         pass
             else:
                 result_text, ok = _invoke_tool_sync(tool, tc["args"], config=config)
-            if ok and isinstance(result_text, str) and result_text.startswith("STAGED:"):
+            if ok and isinstance(result_text, str) and result_text.startswith("STAGED:") and not (
+                tc["name"] in _FILE_EDIT_TOOLS and has_approval_infra
+            ):
                 path_str = tc["args"].get("path", "") or ""
                 operation = "edit" if tc["name"] == "edit_file" else "overwrite"
                 tasks = STAGING_REGISTRY.get_tasks(thread_id) if thread_id else {}

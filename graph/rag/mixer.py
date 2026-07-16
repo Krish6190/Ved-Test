@@ -8,7 +8,12 @@ Exposes:
   - retrieve_context(query, current_thread_id, k, ratio, lambda_mult)
   - _format_rag_block(chunks)  human-readable block for prompt injection
 """
+from pathlib import Path
 from typing import Optional
+
+import re
+
+from graph.tools._common import ALWAYS_SKIP_DIRS, PROJECT_ROOT, is_backup_artifact
 
 # Sentinel scope for chunks that are not tied to any specific thread.
 GLOBAL_SCOPE = "__GLOBAL__"
@@ -150,4 +155,52 @@ def retrieve_context(
     if project_results:
         return project_results[:k]
 
+    raw_disk_results = _raw_disk_fallback(query_text, k=k)
+    if raw_disk_results:
+        return raw_disk_results[:k]
+
     return []
+
+
+def _raw_disk_fallback(query_text: str, k: int = DEFAULT_RAG_K):
+    """Best-effort raw filesystem scan used only after all RAG scopes miss."""
+    needle = (query_text or "").strip().lower()
+    if not needle:
+        return []
+
+    terms = [t for t in re.findall(r"[A-Za-z0-9_./:-]{3,}", needle) if t]
+    if not terms:
+        terms = [needle]
+
+    results = []
+    seen = set()
+    try:
+        for path in Path(PROJECT_ROOT).rglob("*"):
+            if len(results) >= k:
+                break
+            if not path.is_file():
+                continue
+            if any(part in ALWAYS_SKIP_DIRS for part in path.parts):
+                continue
+            if is_backup_artifact(path):
+                continue
+            try:
+                text = path.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                text = ""
+            haystack = f"{str(path).lower()}\n{text.lower()}"
+            if not any(term in haystack for term in terms):
+                continue
+            resolved = str(path.resolve())
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            snippet = text[:1200] if text else str(path)
+            results.append({
+                "content": snippet,
+                "source": str(path.relative_to(PROJECT_ROOT)).replace("\\", "/"),
+                "scope": "disk",
+            })
+    except Exception:
+        return []
+    return results

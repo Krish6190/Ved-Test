@@ -62,11 +62,17 @@ class _Session:
 
 
 class StagingRegistry:
-    """Global, thread-safe registry of pending file edits keyed by session."""
+    """Global, thread-safe registry of pending file edits keyed by session.
+
+    Tracks announced paths via a per-session set to prevent duplicate
+    UI update events. The set is cleared when the session's tasks are
+    inspected or flushed.
+    """
 
     def __init__(self):
         self._sessions: Dict[str, _Session] = {}
         self._global_lock = Lock()
+        self._announced_paths: Dict[str, set[str]] = {}
 
     def register_session(
         self,
@@ -169,6 +175,53 @@ class StagingRegistry:
         with session.lock:
             return dict(session.tasks)
 
+    def get_unannounced_paths(self, thread_id: str) -> List[str]:
+        """Return paths that have staged tasks but have not yet been
+        announced to the UI. The caller is expected to:
+
+          1. Render these paths in the chat log (one announcement per path).
+          2. Call ``mark_paths_announced`` with the same list to suppress
+             future announcements until a new edit lands on the same path.
+
+        Inner rolling lists are NEVER iterated here — only the keys of the
+        tasks dict are exposed, which is cheap and avoids walking the
+        5-element version history.
+        """
+        session = self._get_session(thread_id)
+        if session is None:
+            return []
+        with self._global_lock:
+            already = set(self._announced_paths.get(thread_id, set()))
+        with session.lock:
+            pending_paths = set(session.tasks.keys())
+        unseen = sorted(pending_paths - already)
+        return unseen
+
+    def mark_paths_announced(self, thread_id: str, paths: List[str]) -> None:
+        """Record `paths` as announced so subsequent calls to
+        ``get_unannounced_paths`` skip them until a new edit resets them.
+
+        Called by the chatbot.py stream consumer right after the chat
+        log renders the announcement so a duplicate render in the same
+        turn (e.g., when the executor adds more tasks) does not produce
+        a second copy of the same path announcement.
+        """
+        if not thread_id or not paths:
+            return
+        with self._global_lock:
+            bucket = self._announced_paths.setdefault(thread_id, set())
+            for p in paths:
+                bucket.add(p)
+
+    def reset_announced_paths(self, thread_id: str) -> None:
+        """Clear the announced-paths tracking for a session. Called after
+        the user resolves (approve / reject) so a future edit to the same
+        path is announced again."""
+        if not thread_id:
+            return
+        with self._global_lock:
+            self._announced_paths.pop(thread_id, None)
+
     def get_version_count(self, thread_id: str, resolved_path: str) -> int:
         """Return how many in-memory versions are stored for a staged path."""
         session = self._get_session(thread_id)
@@ -182,12 +235,22 @@ class StagingRegistry:
 
         Returns a dict with keys:
           - ok (bool)
+          - reason (str | None)  present when ok is False; either
+              "no_session" (session not registered), "no_versions"
+              (no edits ever staged for this path), or "single_version"
+              (only one staged edit — nothing to roll back further).
           - remaining_versions (int)
           - current_text (str | None)
+
+        Callers should inspect `reason` to distinguish "the path has
+        never been edited" from "only one edit exists, so rollback has
+        nowhere to go". Previously both cases returned ok=False silently,
+        which made UI feedback indistinguishable.
         """
         session = self._get_session(thread_id)
         result: Dict[str, Any] = {
             "ok": False,
+            "reason": "no_session",
             "remaining_versions": 0,
             "current_text": None,
         }
@@ -196,7 +259,13 @@ class StagingRegistry:
 
         with session.lock:
             versions = session.code_versions.get(resolved_path) or []
-            if len(versions) <= 1:
+            if not versions:
+                result["reason"] = "no_versions"
+                return result
+            if len(versions) == 1:
+                result["reason"] = "single_version"
+                result["remaining_versions"] = 1
+                result["current_text"] = versions[0]
                 return result
 
             versions.pop()
@@ -216,6 +285,7 @@ class StagingRegistry:
                 session.tasks[resolved_path] = task
 
             result["ok"] = True
+            result["reason"] = None
             result["remaining_versions"] = len(versions)
             result["current_text"] = current
             return result
