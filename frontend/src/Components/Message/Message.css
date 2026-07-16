@@ -1,0 +1,125 @@
+.message-row {
+    display: flex;
+    width: 100%;
+    margin-bottom: 18px;
+}
+
+.user-row {
+    justify-content: flex-end;
+}
+
+.assistant-row {
+    justify-content: flex-start;
+}
+
+.message-card {
+    width: min(900px, 85%);
+    display: flex;
+    flex-direction: column;
+    border-radius: 12px;
+    overflow: hidden;
+    border: 1px solid var(--border-subtle);
+    background: var(--bg-surface);
+    transition:
+        transform .18s ease,
+        border-color .18s ease,
+        box-shadow .18s ease;
+}
+
+.message-card:hover {
+    border-color: var(--color-turbo);
+    box-shadow: 0 8px 28px rgba(0,0,0,.35);
+}
+
+.user-card {
+    border-left: 4px solid var(--color-standard);
+}
+
+.assistant-card {
+    border-left: 4px solid var(--color-turbo);
+}
+
+.tool-card {
+    border-left: 4px solid #c792ea;
+}
+
+.message-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 12px 18px;
+    background: rgba(255,255,255,.02);
+    border-bottom: 1px solid var(--border-subtle);
+}
+
+.message-avatar {
+    font-size: 16px;
+}
+
+.message-author {
+    font-weight: 700;
+    letter-spacing: .5px;
+    color: var(--text-primary);
+    font-size: 13px;
+    text-transform: uppercase;
+}
+
+.message-body {
+    padding: 18px;
+    color: var(--text-primary);
+    line-height: 1.8;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-size: 14px;
+}
+
+.message-body h1,
+.message-body h2,
+.message-body h3 {
+    margin-top: 18px;
+    margin-bottom: 10px;
+}
+
+.message-body p {
+    margin: 10px 0;
+}
+
+.message-body ul,
+.message-body ol {
+    margin-left: 24px;
+}
+
+.message-body code {
+    background: rgba(255,255,255,.08);
+    padding: 2px 5px;
+    border-radius: 4px;
+    font-family: Consolas, monospace;
+}
+
+.code-block {
+    margin: 18px 0;
+    border: 1px solid var(--border-subtle);
+    border-radius: 10px;
+    overflow: hidden;
+}
+
+.code-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    background: var(--bg-panel);
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border-subtle);
+}
+
+.copy-btn {
+    background: transparent;
+    color: var(--text-primary);
+    border: none;
+    cursor: pointer;
+    font-size: 12px;
+}
+
+.copy-btn:hover {
+    color: var(--color-turbo);
+}

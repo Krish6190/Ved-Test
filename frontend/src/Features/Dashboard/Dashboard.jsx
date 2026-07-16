@@ -6,6 +6,8 @@ import ChatInput from "../../components/ChatInput/ChatInput";
 import ThreadSidebar from "../../components/ThreadSidebar/ThreadSidebar";
 import { useChatManager } from "../../hooks/useChatManager";
 import "./Dashboard.css";
+import { MODES } from "../../constants/modes";
+import Conversation from "../../components/Conversation/Conversation";
 
 const sidebarTransition = {
     duration: 0.3,
@@ -31,12 +33,7 @@ const Dashboard = () => {
         setActiveThreadId
     } = useChatManager();
 
-    const modes = [
-        { label: "Coder", icon: "💻" },
-        { label: "Turbo", icon: "⚡" },
-        { label: "Standard", icon: "🌐" },
-        { label: "Hibernate", icon: "⏳" }
-    ];
+    const modes = MODES;
 
     return (
         <div className="dashboard-window">
@@ -127,32 +124,9 @@ const Dashboard = () => {
                     {currentMode.toUpperCase()} mode.
                 </span>
             </div>
-            <div className="output-viewport">
-                {activeMessages.length === 0 ? (
-                    <div className="empty-state">
-                        No terminal messages log parsed.
-                        Initialize engine prompt below.
-                    </div>
-                ) : (
-                    activeMessages.map((msg, index) => (
-                        <div
-                            key={index}
-                            className={`message-row ${msg.sender}-row`}
-                        >
-                            <div className="message-bubble">
-                                <span className="sender-tag">
-                                    {msg.sender === "user"
-                                        ? "↳ User"
-                                        : "⚙️ Ved"}
-                                </span>
-                                <p className="message-text">
-                                    {msg.text}
-                                </p>
-                            </div>
-                        </div>
-                    ))
-                )}
-            </div>
+            <Conversation
+                messages={activeMessages}
+            />
             <ChatInput onSendMessage={sendMessage} />
         </div>
     );

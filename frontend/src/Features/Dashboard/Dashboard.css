@@ -70,56 +70,6 @@
     font-family: 'Courier New', Courier, monospace;
 }
 
-.message-row {
-    display: flex;
-    width: 100%;
-}
-
-.user-row {
-    justify-content: flex-end;
-}
-
-.ved-row {
-    justify-content: flex-start;
-}
-
-.message-bubble {
-    max-width: 80%;
-    padding: 14px 18px;
-    border-radius: 8px;
-    background-color: var(--bg-surface);
-    border: 1px solid var(--border-subtle);
-}
-
-.user-row .message-bubble {
-    background-color: var(--bg-panel);
-    border-color: var(--color-standard);
-}
-
-.sender-tag {
-    font-size: 11px;
-    font-weight: 700;
-    letter-spacing: 0.5px;
-    margin-bottom: 6px;
-    display: block;
-}
-
-.user-row .sender-tag {
-    color: var(--color-turbo);
-}
-
-.ved-row .sender-tag {
-    color: var(--text-terminal);
-}
-
-.message-text {
-    color: var(--text-primary);
-    font-size: 14px;
-    margin: 0;
-    line-height: 1.6;
-    white-space: pre-wrap;
-}
-
 /* ================= SIDEBAR ================= */
 
 .sidebar-overlay {

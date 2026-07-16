@@ -1,0 +1,32 @@
+.conversation {
+    flex: 1;
+    overflow-y: auto;
+    scroll-behavior: smooth;
+    padding: 24px;
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+    background-image:
+        linear-gradient(
+            rgba(11,9,9,.55) 1px,
+            transparent 1px
+        );
+    background-size:100% 4px;
+}
+
+.conversation-empty{
+    flex:1;
+    display:flex;
+    flex-direction:column;
+    align-items:center;
+    justify-content:center;
+}
+
+.conversation-empty h2{
+    color:white;
+    margin-bottom:10px;
+}
+
+.conversation-empty p{
+    color:var(--text-muted);
+}

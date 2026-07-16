@@ -1,0 +1,21 @@
+body{
+
+    font-family:
+        Inter,
+        Segoe UI,
+        sans-serif;
+
+    font-size:14px;
+
+    color:var(--text-primary);
+
+}
+
+code{
+
+    font-family:
+        JetBrains Mono,
+        Consolas,
+        monospace;
+
+}
